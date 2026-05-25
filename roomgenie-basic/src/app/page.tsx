@@ -1,3 +1,4 @@
+'use client'
 const IMGS = {
   hero:        'https://images.unsplash.com/photo-1600210492493-0946911123ea?w=1400&q=85&auto=format&fit=crop',
   heroAfter:   'https://images.unsplash.com/photo-1618219908412-a29a1bb7b86e?w=1400&q=85&auto=format&fit=crop',
