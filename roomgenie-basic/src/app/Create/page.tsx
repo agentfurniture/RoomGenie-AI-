@@ -43,6 +43,7 @@ export default function CreatePage() {
       sessionStorage.setItem('genImage', data.image)
       sessionStorage.setItem('genStyle', style)
       sessionStorage.setItem('genRoom', room)
+      if (data.design) sessionStorage.setItem('genDesign', JSON.stringify(data.design))
       router.push('/results')
     } catch { setError('Something went wrong. Please check your API key.') }
     finally { setLoading(false) }
@@ -246,4 +247,3 @@ export default function CreatePage() {
     </main>
   )
 }
-
