@@ -9,7 +9,7 @@ export async function POST(req: Request) {
     if (!message) return NextResponse.json({ error: 'Message required' }, { status: 400 })
 
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-5',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 400,
       system: `You are an expert luxury interior designer with 20 years of experience.
 Give specific, actionable advice about color palettes, furniture layout, lighting, textures, storage, and decor.
