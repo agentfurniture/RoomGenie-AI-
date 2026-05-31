@@ -1,59 +1,57 @@
 import { NextResponse } from 'next/server'
 import Anthropic from '@anthropic-ai/sdk'
+import { buildPrompt } from '@/lib/prompts'
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
-const styleDetails: Record<string, string> = {
-  Modern:        'Clean lines, neutral palette, contemporary furniture, minimalist decor',
-  Luxury:        'Opulent finishes, marble surfaces, gold accents, velvet textures, statement lighting',
-  Minimalist:    'White walls, sparse furniture, hidden storage, abundant negative space, calm atmosphere',
-  Scandinavian:  'Natural wood, white walls, cozy textures, functional furniture, hygge atmosphere',
-  Industrial:    'Exposed brick, concrete floors, metal pipe fixtures, Edison bulbs, raw materials',
-  Classic:       'Traditional furniture, crown molding, rich fabrics, symmetrical layout, antique accents',
-  Bohemian:      'Layered textiles, eclectic decor, plants, warm earth tones, mixed patterns',
-  Japanese:      'Tatami, shoji screens, minimal furniture, natural materials, zen atmosphere',
-}
-
 export async function POST(req: Request) {
   try {
-    const formData = await req.formData()
-    const style    = (formData.get('style')    as string) || 'Modern'
-    const roomType = (formData.get('roomType') as string) || 'Room'
-    const custom   = (formData.get('prompt')   as string) || ''
-    const details  = styleDetails[style] || style
+    const formData  = await req.formData()
+    const style     = (formData.get('style')     as string) || 'Modern'
+    const roomType  = (formData.get('roomType')  as string) || 'Living Room'
+    const prompt    = (formData.get('prompt')    as string) || ''
+    const answersRaw = formData.get('answers') as string
+    const dimsRaw    = formData.get('dimensions') as string
+    const furniture  = formData.get('furniture') as string
 
-    // Use Claude to generate a detailed design description + Unsplash image suggestion
+    const answers    = answersRaw ? JSON.parse(answersRaw) : {}
+    const dimensions = dimsRaw    ? JSON.parse(dimsRaw)    : {}
+    const furnitureItems = furniture ? JSON.parse(furniture) : []
+
+    const designPrompt = buildPrompt({ style, roomType, prompt, answers, dimensions, furnitureItems })
+
+    // Claude generates design details + Unsplash image
     const response = await anthropic.messages.create({
       model: 'claude-haiku-4-5-20251001',
-      max_tokens: 800,
-      system: `You are an expert interior designer. When given a room type and style, respond ONLY with a valid JSON object, no markdown, no backticks. Format:
+      max_tokens: 900,
+      system: `You are an expert interior designer. Respond ONLY with a valid JSON object (no markdown, no backticks):
 {
-  "title": "short design title",
-  "description": "2-3 sentence vivid description of the redesigned room",
-  "colors": ["color1", "color2", "color3"],
-  "furniture": ["item1", "item2", "item3", "item4"],
-  "tips": ["tip1", "tip2", "tip3"],
-  "unsplashQuery": "specific search query for this exact room style e.g. modern living room interior"
+  "title": "creative short design title",
+  "tagline": "one evocative sentence",
+  "description": "2-3 vivid sentences describing the redesigned space",
+  "colors": ["#hexcode - Color Name", "#hexcode - Color Name", "#hexcode - Color Name", "#hexcode - Color Name"],
+  "furniture": ["Specific furniture piece 1", "Specific furniture piece 2", "Specific furniture piece 3", "Specific furniture piece 4", "Specific furniture piece 5"],
+  "tips": ["Specific actionable design tip 1", "Specific actionable design tip 2", "Specific actionable design tip 3"],
+  "materials": ["Material 1", "Material 2", "Material 3"],
+  "unsplashQuery": "very specific interior photo search query"
 }`,
-      messages: [{
-        role: 'user',
-        content: `Design a ${style} ${roomType}. Style details: ${details}. ${custom ? `Extra requirements: ${custom}` : ''}`
-      }]
+      messages: [{ role: 'user', content: `Design brief: ${designPrompt}` }],
     })
 
-    const text = response.content[0].type === 'text' ? response.content[0].text : '{}'
+    const raw = response.content[0].type === 'text' ? response.content[0].text.trim() : '{}'
     let design
     try {
-      design = JSON.parse(text)
+      const cleaned = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim()
+      design = JSON.parse(cleaned)
     } catch {
-      design = { title: `${style} ${roomType}`, description: text, colors: [], furniture: [], tips: [] }
+      design = { title: `${style} ${roomType}`, tagline: 'Your dream space awaits', description: raw, colors: [], furniture: [], tips: [], materials: [] }
     }
 
-    // Use Unsplash source for a relevant room image (no API key needed)
-    const query = encodeURIComponent(design.unsplashQuery || `${style} ${roomType} interior`)
-    const imageUrl = `https://source.unsplash.com/1600x900/?${query}`
+    const query  = encodeURIComponent(design.unsplashQuery || `${style.toLowerCase()} ${roomType.toLowerCase()} interior design`)
+    const seed   = Math.floor(Math.random() * 1000)
+    const image  = `https://source.unsplash.com/1600x900/?${query}&sig=${seed}`
 
-    return NextResponse.json({ image: imageUrl, design })
+    return NextResponse.json({ image, design, prompt: designPrompt })
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Generation failed'
     console.error('Generate error:', msg)
