@@ -1,57 +1,73 @@
 import { NextResponse } from 'next/server'
 import Anthropic from '@anthropic-ai/sdk'
-import { buildPrompt } from '@/lib/prompts'
+import OpenAI from 'openai'
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+const openai    = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+
+const STYLE_DETAILS: Record<string, string> = {
+  Modern:        'clean lines, neutral whites/greys, contemporary furniture, minimal clutter, metal accents',
+  Luxury:        'opulent marble surfaces, gold brass accents, velvet textures, crystal chandeliers, jewel tones',
+  Minimalist:    'pure white walls, hidden storage, only essential furniture, vast empty space, zen calm',
+  Scandinavian:  'natural birch wood, white walls, hygge atmosphere, sheepskin, candles, organic textures',
+  Industrial:    'exposed brick, concrete floors, black iron pipes, Edison bulbs, reclaimed wood beams',
+  Bohemian:      'layered colorful textiles, macramé wall art, abundant plants, rattan, eclectic patterns',
+  Japandi:       'wabi-sabi imperfection, shoji screens, bonsai, tatami, neutral earth tones, handmade ceramics',
+  Classic:       'traditional carved furniture, crown moulding, rich fabrics, symmetrical layout, antique accents',
+}
 
 export async function POST(req: Request) {
   try {
-    const formData  = await req.formData()
-    const style     = (formData.get('style')     as string) || 'Modern'
-    const roomType  = (formData.get('roomType')  as string) || 'Living Room'
-    const prompt    = (formData.get('prompt')    as string) || ''
-    const answersRaw = formData.get('answers') as string
-    const dimsRaw    = formData.get('dimensions') as string
-    const furniture  = formData.get('furniture') as string
+    const formData = await req.formData()
+    const style    = (formData.get('style')    as string) || 'Modern'
+    const roomType = (formData.get('roomType') as string) || 'Living Room'
+    const custom   = (formData.get('prompt')   as string) || ''
+    const details  = STYLE_DETAILS[style] || style
 
-    const answers    = answersRaw ? JSON.parse(answersRaw) : {}
-    const dimensions = dimsRaw    ? JSON.parse(dimsRaw)    : {}
-    const furnitureItems = furniture ? JSON.parse(furniture) : []
-
-    const designPrompt = buildPrompt({ style, roomType, prompt, answers, dimensions, furnitureItems })
-
-    // Claude generates design details + Unsplash image
-    const response = await anthropic.messages.create({
+    // Step 1: Claude generates design details
+    const claudeResp = await anthropic.messages.create({
       model: 'claude-haiku-4-5-20251001',
-      max_tokens: 900,
-      system: `You are an expert interior designer. Respond ONLY with a valid JSON object (no markdown, no backticks):
-{
-  "title": "creative short design title",
-  "tagline": "one evocative sentence",
-  "description": "2-3 vivid sentences describing the redesigned space",
-  "colors": ["#hexcode - Color Name", "#hexcode - Color Name", "#hexcode - Color Name", "#hexcode - Color Name"],
-  "furniture": ["Specific furniture piece 1", "Specific furniture piece 2", "Specific furniture piece 3", "Specific furniture piece 4", "Specific furniture piece 5"],
-  "tips": ["Specific actionable design tip 1", "Specific actionable design tip 2", "Specific actionable design tip 3"],
-  "materials": ["Material 1", "Material 2", "Material 3"],
-  "unsplashQuery": "very specific interior photo search query"
-}`,
-      messages: [{ role: 'user', content: `Design brief: ${designPrompt}` }],
+      max_tokens: 700,
+      system: `You are an expert interior designer. Respond ONLY with valid JSON, no markdown, no backticks:
+{"title":"short creative title","tagline":"one evocative sentence","description":"2-3 vivid sentences about the redesigned space","colors":["#hex - Color Name","#hex - Color Name","#hex - Color Name"],"furniture":["item1","item2","item3","item4"],"tips":["tip1","tip2","tip3"],"materials":["material1","material2","material3"],"imagePrompt":"ultra-specific photorealistic interior photo description for DALL-E"}`,
+      messages: [{ role: 'user', content: `Design a ${style} ${roomType}. Style: ${details}. ${custom ? 'Extra: ' + custom : ''}` }],
     })
 
-    const raw = response.content[0].type === 'text' ? response.content[0].text.trim() : '{}'
-    let design
+    const raw = claudeResp.content[0].type === 'text' ? claudeResp.content[0].text.trim() : '{}'
+    let design: Record<string, unknown>
     try {
-      const cleaned = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim()
-      design = JSON.parse(cleaned)
+      design = JSON.parse(raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim())
     } catch {
-      design = { title: `${style} ${roomType}`, tagline: 'Your dream space awaits', description: raw, colors: [], furniture: [], tips: [], materials: [] }
+      design = { title: `${style} ${roomType}`, description: raw }
     }
 
-    const query  = encodeURIComponent(design.unsplashQuery || `${style.toLowerCase()} ${roomType.toLowerCase()} interior design`)
-    const seed   = Math.floor(Math.random() * 1000)
-    const image  = `https://source.unsplash.com/1600x900/?${query}&sig=${seed}`
+    // Step 2: DALL-E 3 generates the image
+    const imgPrompt = [
+      `Photorealistic ${style} interior design of a ${roomType}.`,
+      `Style details: ${details}.`,
+      typeof design.imagePrompt === 'string' ? design.imagePrompt : '',
+      custom || '',
+      'Professional architectural photography, Architectural Digest quality.',
+      'Perfect lighting, ultra detailed render, no people.',
+    ].filter(Boolean).join(' ')
 
-    return NextResponse.json({ image, design, prompt: designPrompt })
+    let imageUrl: string
+    try {
+      const imgResp = await openai.images.generate({
+        model: 'dall-e-3',
+        prompt: imgPrompt,
+        size: '1792x1024',
+        quality: 'hd',
+        n: 1,
+      })
+      imageUrl = imgResp.data[0]?.url || `https://source.unsplash.com/1600x900/?${encodeURIComponent(style + ' ' + roomType + ' interior')}`
+    } catch {
+      // Fallback to Unsplash if DALL-E fails
+      const q = encodeURIComponent(`${style.toLowerCase()} ${roomType.toLowerCase()} interior design`)
+      imageUrl = `https://source.unsplash.com/1600x900/?${q}&sig=${Date.now()}`
+    }
+
+    return NextResponse.json({ image: imageUrl, design })
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Generation failed'
     console.error('Generate error:', msg)
