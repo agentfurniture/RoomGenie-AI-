@@ -3,7 +3,7 @@ import './globals.css'
 
 export const metadata: Metadata = {
   title: 'RoomGenie AI — AI Interior Design Platform',
-  description: 'Transform any room into your dream space using AI. Upload a photo, choose a style, get a photorealistic redesign in seconds.',
+  description: 'Transform any room into your dream space using AI. Upload a photo, choose a style, get a photorealistic redesign in seconds — powered by Claude AI.',
 }
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
@@ -12,7 +12,13 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <head>
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
-        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet" />
+        <link
+          href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap"
+          rel="stylesheet"
+        />
+        <style>{`
+          body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif !important; }
+        `}</style>
       </head>
       <body>{children}</body>
     </html>
