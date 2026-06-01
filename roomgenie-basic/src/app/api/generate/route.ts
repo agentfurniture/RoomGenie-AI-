@@ -1,9 +1,4 @@
 import { NextResponse } from 'next/server'
-import Anthropic from '@anthropic-ai/sdk'
-import OpenAI from 'openai'
-
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
-const openai    = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
 const STYLE_DETAILS: Record<string, string> = {
   Modern:        'clean lines, neutral whites/greys, contemporary furniture, minimal clutter, metal accents',
@@ -14,10 +9,19 @@ const STYLE_DETAILS: Record<string, string> = {
   Bohemian:      'layered colorful textiles, macramé wall art, abundant plants, rattan, eclectic patterns',
   Japandi:       'wabi-sabi imperfection, shoji screens, bonsai, tatami, neutral earth tones, handmade ceramics',
   Classic:       'traditional carved furniture, crown moulding, rich fabrics, symmetrical layout, antique accents',
+  Contemporary:  'current trends, bold accent walls, mixed materials, statement lighting, open plan',
+  Mediterranean: 'terracotta tiles, whitewashed walls, arched doorways, blue accents, wrought iron, lush plants',
 }
 
 export async function POST(req: Request) {
   try {
+    // Lazy-load clients inside handler so env vars are available at runtime
+    const Anthropic = (await import('@anthropic-ai/sdk')).default
+    const OpenAI    = (await import('openai')).default
+
+    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+    const openai    = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+
     const formData = await req.formData()
     const style    = (formData.get('style')    as string) || 'Modern'
     const roomType = (formData.get('roomType') as string) || 'Living Room'
@@ -54,17 +58,15 @@ export async function POST(req: Request) {
     let imageUrl: string
     try {
       const imgResp = await openai.images.generate({
-        model: 'dall-e-3',
-        prompt: imgPrompt,
-        size: '1792x1024',
+        model:   'dall-e-3',
+        prompt:  imgPrompt,
+        size:    '1792x1024',
         quality: 'hd',
-        n: 1,
+        n:       1,
       })
-      imageUrl = imgResp.data[0]?.url || `https://source.unsplash.com/1600x900/?${encodeURIComponent(style + ' ' + roomType + ' interior')}`
+      imageUrl = imgResp.data[0]?.url || fallbackImage(style, roomType)
     } catch {
-      // Fallback to Unsplash if DALL-E fails
-      const q = encodeURIComponent(`${style.toLowerCase()} ${roomType.toLowerCase()} interior design`)
-      imageUrl = `https://source.unsplash.com/1600x900/?${q}&sig=${Date.now()}`
+      imageUrl = fallbackImage(style, roomType)
     }
 
     return NextResponse.json({ image: imageUrl, design })
@@ -73,4 +75,9 @@ export async function POST(req: Request) {
     console.error('Generate error:', msg)
     return NextResponse.json({ error: msg }, { status: 500 })
   }
+}
+
+function fallbackImage(style: string, roomType: string): string {
+  const q = encodeURIComponent(`${style.toLowerCase()} ${roomType.toLowerCase()} interior design`)
+  return `https://source.unsplash.com/1600x900/?${q}&sig=${Date.now()}`
 }
