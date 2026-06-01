@@ -1,3 +1,4 @@
+"use client"
 import Link from 'next/link'
 
 const PLANS = [
@@ -61,4 +62,3 @@ export default function PricingCards() {
     </div>
   )
 }
-
