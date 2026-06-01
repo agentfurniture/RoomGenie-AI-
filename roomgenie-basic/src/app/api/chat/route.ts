@@ -1,24 +1,18 @@
 import { NextResponse } from 'next/server'
 import Anthropic from '@anthropic-ai/sdk'
-import { buildChatSystemPrompt } from '@/lib/prompts'
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
 export async function POST(req: Request) {
   try {
-    const { message, history } = await req.json()
+    const { message } = await req.json()
     if (!message) return NextResponse.json({ error: 'Message required' }, { status: 400 })
 
-    const messages = [
-      ...(history || []).slice(-10),
-      { role: 'user' as const, content: message },
-    ]
-
     const response = await anthropic.messages.create({
-      model:      'claude-haiku-4-5-20251001',
-      max_tokens: 450,
-      system:     buildChatSystemPrompt(),
-      messages,
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 400,
+      system: `You are an expert luxury interior designer with 20 years of experience. Give specific, actionable advice about color palettes, furniture layout, lighting, textures, and decor. Keep responses to 3-5 sentences — concise but packed with value. Be encouraging and creative.`,
+      messages: [{ role: 'user', content: message }],
     })
 
     const reply = response.content[0].type === 'text' ? response.content[0].text : ''
