@@ -1,3 +1,4 @@
+"use client"
 import Link from 'next/link'
 
 const LINKS = {
@@ -54,4 +55,3 @@ export default function Footer() {
     </footer>
   )
 }
-
