@@ -1,10 +1,10 @@
 import { NextResponse } from 'next/server'
-import Anthropic from '@anthropic-ai/sdk'
-
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
 export async function POST(req: Request) {
   try {
+    const Anthropic = (await import('@anthropic-ai/sdk')).default
+    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+
     const { message } = await req.json()
     if (!message) return NextResponse.json({ error: 'Message required' }, { status: 400 })
 
