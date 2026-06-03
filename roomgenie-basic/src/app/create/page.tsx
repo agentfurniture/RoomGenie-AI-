@@ -17,7 +17,7 @@ function hexToRgb(hex: string): [number, number, number] {
   return [parseInt(h.slice(0,2),16)/255, parseInt(h.slice(2,4),16)/255, parseInt(h.slice(4,6),16)/255]
 }
 
-function RoomViewer3D({ layoutJSON, style }: { layoutJSON: LayoutJSON; style: string }) {
+function RoomViewer3D({ layoutJSON, style, roomType }: { layoutJSON: LayoutJSON; style: string; roomType: string }) {
   const canvasRef   = useRef<HTMLCanvasElement>(null)
   const rafRef      = useRef<number>(0)
   const angleRef    = useRef(0.5)
