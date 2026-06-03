@@ -1,6 +1,8 @@
 'use client'
-import { useState, useCallback, useRef, useEffect } from 'react'
+import { useState, useCallback, useRef, useEffect, lazy, Suspense } from 'react'
 import Link from 'next/link'
+
+const RoomViewer3D = lazy(() => import('@/components/RoomViewer3D'))
 
 /* ─── CONSTANTS ──────────────────────────────────────────────────── */
 const STEPS = [
@@ -40,11 +42,20 @@ const BUDGETS  = ['Under $1K', '$1K–$5K', '$5K–$15K', '$15K–$50K', '$50K+'
 const LIGHTING = ['Very Bright', 'Moderate', 'Low Light', 'No Windows']
 const MATERIALS= ['Wood & Natural', 'Marble & Stone', 'Metal & Glass', 'Fabric & Soft', 'Mixed Materials']
 
+type LayoutJSON = {
+  dimensions: { widthFt: number; lengthFt: number; heightFt: number; sqft: number }
+  furniture:  Array<{ id: string; type: string; label: string; color: string; material: string; xFrac: number; yFrac: number; wFrac: number; dFrac: number; heightFt: number; rotation: number; preserved: boolean; notes: string }>
+  floor:   { material: string; color: string }
+  walls:   { color: string; material: string; accentWall?: string }
+  palette: { primary: string; secondary: string; accent: string; neutral: string }
+}
+
 type DesignResult = {
   image: string
   floorPlan: string | null
   hasDimensions: boolean
   dimensions: { w: string; l: string; h: string; sqft: number } | null
+  layoutJSON: LayoutJSON | null
   design: {
     title?: string; tagline?: string; description?: string; spatialNote?: string
     colors?: string[]; furniture?: string[]; tips?: string[]; materials?: string[]
@@ -549,27 +560,31 @@ export default function CreatePage() {
         {/* ── IMAGES SIDE BY SIDE ── */}
         <div style={{ display: 'grid', gridTemplateColumns: hasFP ? '1fr 1fr' : '1fr', gap: 16, marginBottom: 20 }}>
 
-          {/* 3D Render */}
+          {/* 3D Live Viewer */}
           <div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
               <div style={{ width: 22, height: 22, borderRadius: 7, background: 'linear-gradient(135deg,#4f7cff,#7c3aed)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, color: 'white', fontWeight: 800 }}>3D</div>
-              <span style={{ fontSize: 13, fontWeight: 700, color: '#0f172a' }}>3D Room Render</span>
+              <span style={{ fontSize: 13, fontWeight: 700, color: '#0f172a' }}>3D Room Viewer</span>
+              <span style={{ fontSize: 11, color: '#94a3b8' }}>· drag to orbit</span>
             </div>
-            <div style={{ borderRadius: 16, overflow: 'hidden', boxShadow: '0 8px 32px rgba(0,0,0,0.12)', position: 'relative' }}>
-              <img src={result.image} alt={`${style} ${roomType} 3D render`}
-                style={{ width: '100%', display: 'block', height: hasFP ? 340 : 420, objectFit: 'cover' }}
-                onError={e => { (e.target as HTMLImageElement).src = 'https://images.unsplash.com/photo-1618219908412-a29a1bb7b86e?w=1200&q=85&auto=format&fit=crop' }} />
-              <div style={{ position: 'absolute', top: 10, right: 10, background: 'rgba(255,255,255,0.92)', backdropFilter: 'blur(8px)', borderRadius: 8, padding: '4px 10px', fontSize: 11, fontWeight: 700, color: '#4f7cff' }}>✦ AI Render</div>
-              {dims && (
-                <div style={{ position: 'absolute', bottom: 10, left: 10, background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(8px)', borderRadius: 8, padding: '4px 10px', fontSize: 11, fontWeight: 600, color: 'white' }}>
-                  {dims.w}×{dims.l}ft · {dims.sqft} sq ft
-                </div>
-              )}
-            </div>
-            <a href={result.image} target="_blank" rel="noopener"
-              style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, marginTop: 8, padding: '9px', borderRadius: 10, background: 'linear-gradient(135deg,#4f7cff,#7c3aed)', color: 'white', fontWeight: 700, fontSize: 13, textDecoration: 'none' }}>
-              ⬇ Save 3D Render
-            </a>
+            {result.layoutJSON ? (
+              <RoomViewer3D
+                layoutJSON={result.layoutJSON}
+                style={style}
+                roomType={roomType}
+              />
+            ) : (
+              <div style={{ borderRadius: 16, overflow: 'hidden', boxShadow: '0 8px 32px rgba(0,0,0,0.12)', position: 'relative' }}>
+                <img src={result.image} alt={`${style} ${roomType}`}
+                  style={{ width: '100%', display: 'block', height: hasFP ? 340 : 420, objectFit: 'cover' }}
+                  onError={e => { (e.target as HTMLImageElement).src = 'https://images.unsplash.com/photo-1618219908412-a29a1bb7b86e?w=1200&q=85&auto=format&fit=crop' }} />
+              </div>
+            )}
+            {dims && (
+              <div style={{ marginTop: 6, fontSize: 11, color: '#64748b', textAlign: 'center' }}>
+                📐 {dims.w}×{dims.l}ft · {dims.sqft} sq ft{dims.h ? ` · ${dims.h}ft ceiling` : ''}
+              </div>
+            )}
           </div>
 
           {/* 2D Floor Plan — shown inline if dimensions provided */}
