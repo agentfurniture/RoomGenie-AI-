@@ -86,7 +86,7 @@ function RoomViewer3D({ layoutJSON, style }: { layoutJSON: LayoutJSON; style: st
       const floorM = mat(layoutJSON.floor.color  || '#C4A882', layoutJSON.floor.material === 'marble' ? 0.12 : 0.75, layoutJSON.floor.material === 'marble' ? 0.05 : 0)
       const ceilM  = mat('#FFFFFF', 0.95)
 
-      function box(w: number, h: number, d: number, x: number, y: number, z: number, m: THREE.Material, shadow = true) {
+      function box(w: number, h: number, d: number, x: number, y: number, z: number, m: import('three').Material, shadow = true) {
         const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m)
         mesh.position.set(x, y, z)
         if (shadow) { mesh.castShadow = true; mesh.receiveShadow = true }
