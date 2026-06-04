@@ -7,7 +7,7 @@ type LayoutJSON = {
   dimensions: { widthFt: number; lengthFt: number; heightFt: number; sqft: number }
   furniture:  Array<{ id: string; type: string; label: string; color: string; material: string; xFrac: number; yFrac: number; wFrac: number; dFrac: number; heightFt: number; rotation: number; preserved: boolean; notes: string }>
   floor:   { material: string; color: string }
-  walls:   { color: string; material: string }
+  walls:   { color: string; material: string; accentWall?: string }
   palette: { primary: string; secondary: string; accent: string; neutral: string }
 }
 
