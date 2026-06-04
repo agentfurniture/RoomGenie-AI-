@@ -577,24 +577,63 @@ export async function POST(req: Request) {
     const layout = await planLayout(anthropic, style, roomType, dims, answers, custom, roomContext, furnitureContext)
     console.log(`[Layout] Generated ${layout.furniture.length} furniture pieces`)
 
-    // ── STAGE 3: SVG Floor Plan (deterministic, no API needed) ────────────────
-    const svgString  = generateFloorPlanSVG(layout)
+    // ── STAGE 3: SVG Floor Plan (deterministic from JSON) ────────────────────
+    const svgString       = generateFloorPlanSVG(layout)
     const floorPlanDataUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgString)}`
 
-    // ── STAGE 4: Build render prompt from JSON ────────────────────────────────
+    // ── STAGE 4: Build photorealistic render prompt from the same JSON ────────
     const { prompt, negative } = buildRenderPrompt(layout)
-    console.log('[Prompt] Preview:', prompt.slice(0, 120))
+    console.log('[Prompt]', prompt.slice(0, 120))
 
-    // ── STAGE 5: Generate photorealistic render ───────────────────────────────
-    const renderImage = await generateImage(prompt, negative, 1344, 768)
-    const imageUrl    = renderImage || pollinationsFallback(prompt, 1344, 768)
-    console.log('[Render]', renderImage ? 'Replicate success' : 'Pollinations fallback')
+    // ── STAGE 5: Generate photorealistic render (Replicate SDXL) ─────────────
+    // This is the "real room" image — same furniture/colors/layout as the 3D viewer
+    // Build an ultra-specific prompt that lists every piece of furniture with its
+    // exact position, color and material from the layout JSON
+    const furnitureLine = layout.furniture
+      .filter(f => f.type !== 'rug' && f.heightFt > 1.0)
+      .slice(0, 7)
+      .map(f => {
+        const pos = f.yFrac < 0.3 ? 'against far wall' : f.yFrac > 0.7 ? 'near foreground' : f.xFrac < 0.3 ? 'left side' : f.xFrac > 0.6 ? 'right side' : 'center'
+        return `${f.label} (${f.color} ${f.material}, ${pos})`
+      }).join(', ')
 
-    // ── STAGE 6: Return ───────────────────────────────────────────────────────
+    const photoPrompt = [
+      `photorealistic interior design render of a ${style} ${roomType}`,
+      `${layout.dimensions.sqft} square feet, ${layout.dimensions.widthFt}ft wide by ${layout.dimensions.lengthFt}ft long`,
+      layout.dimensions.heightFt >= 10 ? `soaring ${layout.dimensions.heightFt}ft ceiling` : `${layout.dimensions.heightFt}ft ceiling`,
+      `room contains: ${furnitureLine}`,
+      `floor: ${layout.floor.material} in ${layout.floor.color}`,
+      `walls: ${layout.walls.color} ${layout.walls.material}`,
+      layout.walls.accentWall ? layout.walls.accentWall : '',
+      layout.styleDetails,
+      `${layout.mood} atmosphere`,
+      `lighting: ${layout.lighting.natural}, ${layout.lighting.ambient}`,
+      answers.mood     ? `${answers.mood} mood`     : '',
+      answers.material ? `${answers.material} materials` : '',
+      custom || '',
+      'wide angle architectural photography showing entire room from corner',
+      'Architectural Digest magazine quality, 8K photorealistic, perfect lighting, sharp focus',
+      'no people, no text, no watermarks',
+    ].filter(Boolean).join('. ')
+
+    const photoNegative = [
+      negative,
+      'no cartoon, no illustration, no painting, not blurry, not dark',
+      'not outdoor, not exterior',
+    ].join(', ')
+
+    const photoImage = await generateImage(photoPrompt, photoNegative, 1344, 768)
+    const photoUrl   = photoImage || pollinationsFallback(photoPrompt, 1344, 768)
+    console.log('[Photo render]', photoImage ? 'Replicate success' : 'Pollinations fallback')
+
+    // ── STAGE 6: Return all 3 outputs ─────────────────────────────────────────
     return NextResponse.json({
-      image:         imageUrl,
-      floorPlan:     floorPlanDataUrl,   // SVG data URL — always present, always matches
-      hasDimensions: true,               // always true now — we use defaults if no dims
+      // Output 1: Photorealistic render (Replicate SDXL)
+      image:     photoUrl,
+      // Output 2: SVG floor plan (deterministic from JSON)
+      floorPlan: floorPlanDataUrl,
+      // Output 3: layoutJSON → drives the Three.js 3D viewer on the frontend
+      hasDimensions: true,
       dimensions: {
         w:    String(dims.widthFt),
         l:    String(dims.lengthFt),
@@ -611,7 +650,6 @@ export async function POST(req: Request) {
         tips:        layout.tips        || [],
         materials:   layout.materials   || [],
       },
-      // Pass layout JSON for potential Three.js use on frontend
       layoutJSON: {
         dimensions: layout.dimensions,
         furniture:  layout.furniture,
