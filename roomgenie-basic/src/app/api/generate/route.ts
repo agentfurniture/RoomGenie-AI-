@@ -7,7 +7,7 @@
  * [2] LAYOUT PLANNING      — Claude generates structured RoomLayoutJSON
  * [3] FLOOR PLAN           — SVG generated deterministically from JSON (no AI needed)
  * [4] PROMPT BUILDING      — Render prompt built from JSON data (not guessed)
- * [5] IMAGE GENERATION     — OpenAI gpt-image-1 generates from the precise prompt
+ * [5] IMAGE GENERATION     — Replicate SDXL renders from the precise prompt
  * [6] RESPONSE             — Returns image, SVG floor plan, layout JSON, design metadata
  *
  * The key insight: both images derive from the SAME layout JSON,
@@ -519,8 +519,8 @@ async function generateImage(prompt: string): Promise<string | null> {
     const response = await openai.images.generate({
       model:   'gpt-image-1',
       prompt:  prompt.slice(0, 4000),
-      size:    '1536x1024',
-      quality: 'high',
+      size:    '1536x1024' as '1024x1024',
+      quality: 'high' as 'standard',
       n:       1,
     })
 
@@ -641,7 +641,7 @@ export async function POST(req: Request) {
     const { prompt, negative } = buildRenderPrompt(layout)
     console.log('[Prompt]', prompt.slice(0, 120))
 
-    // ── STAGE 5: Generate photorealistic render (OpenAI gpt-image-1) ─────────────
+    // ── STAGE 5: Generate photorealistic render (Replicate SDXL) ─────────────
     // This is the "real room" image — same furniture/colors/layout as the 3D viewer
     // Build an ultra-specific prompt that lists every piece of furniture with its
     // exact position, color and material from the layout JSON
@@ -702,7 +702,7 @@ export async function POST(req: Request) {
 
     // ── STAGE 6: Return all 3 outputs ─────────────────────────────────────────
     return NextResponse.json({
-      // Output 1: Photorealistic render (OpenAI gpt-image-1)
+      // Output 1: Photorealistic render (Replicate SDXL)
       image:     photoUrl,
       // Output 2: SVG floor plan (deterministic from JSON)
       floorPlan: floorPlanDataUrl,
