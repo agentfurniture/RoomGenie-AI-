@@ -539,10 +539,69 @@ async function generateImage(prompt: string, negative: string, w: number, h: num
   } catch (e) { console.error('[Replicate] Exception:', e); return null }
 }
 
-function pollinationsFallback(prompt: string, w: number, h: number): string {
-  const seed = Date.now()
-  const enc  = encodeURIComponent(prompt.slice(0, 500))
-  return `https://image.pollinations.ai/prompt/${enc}?width=${w}&height=${h}&seed=${seed}&model=flux-pro&nologo=true&enhance=true&nocache=true`
+// Curated direct Unsplash images — keyed by "Style-RoomType"
+// These are guaranteed correct room type images, used when Replicate fails
+const FALLBACK_IMAGES: Record<string, string> = {
+  // Modern
+  'Modern-Living Room':   'https://images.unsplash.com/photo-1583847268964-b28dc8f51f92?w=1400&q=90&auto=format&fit=crop',
+  'Modern-Bedroom':       'https://images.unsplash.com/photo-1616594039964-ae9021a400a0?w=1400&q=90&auto=format&fit=crop',
+  'Modern-Kitchen':       'https://images.unsplash.com/photo-1556909114-f6e7ad7d3136?w=1400&q=90&auto=format&fit=crop',
+  'Modern-Bathroom':      'https://images.unsplash.com/photo-1552321554-5fefe8c9ef14?w=1400&q=90&auto=format&fit=crop',
+  'Modern-Home Office':   'https://images.unsplash.com/photo-1593642632559-0c6d3fc62b89?w=1400&q=90&auto=format&fit=crop',
+  'Modern-Dining Room':   'https://images.unsplash.com/photo-1615529162924-f8605388461d?w=1400&q=90&auto=format&fit=crop',
+  // Luxury
+  'Luxury-Living Room':   'https://images.unsplash.com/photo-1618219908412-a29a1bb7b86e?w=1400&q=90&auto=format&fit=crop',
+  'Luxury-Bedroom':       'https://images.unsplash.com/photo-1631049307264-da0ec9d70304?w=1400&q=90&auto=format&fit=crop',
+  'Luxury-Bathroom':      'https://images.unsplash.com/photo-1600566752355-35792bedcfea?w=1400&q=90&auto=format&fit=crop',
+  'Luxury-Dining Room':   'https://images.unsplash.com/photo-1615529328331-f8917597711f?w=1400&q=90&auto=format&fit=crop',
+  'Luxury-Kitchen':       'https://images.unsplash.com/photo-1556909172-54557c7e4fb7?w=1400&q=90&auto=format&fit=crop',
+  // Minimalist
+  'Minimalist-Living Room':'https://images.unsplash.com/photo-1598928506311-c55ded91a20c?w=1400&q=90&auto=format&fit=crop',
+  'Minimalist-Bedroom':   'https://images.unsplash.com/photo-1540518614846-7eded433c457?w=1400&q=90&auto=format&fit=crop',
+  'Minimalist-Kitchen':   'https://images.unsplash.com/photo-1556909172-54557c7e4fb7?w=1400&q=90&auto=format&fit=crop',
+  'Minimalist-Bathroom':  'https://images.unsplash.com/photo-1552321554-5fefe8c9ef14?w=1400&q=90&auto=format&fit=crop',
+  // Scandinavian
+  'Scandinavian-Living Room':'https://images.unsplash.com/photo-1586023492125-27b2c045efd7?w=1400&q=90&auto=format&fit=crop',
+  'Scandinavian-Bedroom': 'https://images.unsplash.com/photo-1523741543316-beb7fc7023d8?w=1400&q=90&auto=format&fit=crop',
+  'Scandinavian-Kitchen': 'https://images.unsplash.com/photo-1556909114-f6e7ad7d3136?w=1400&q=90&auto=format&fit=crop',
+  // Industrial
+  'Industrial-Living Room':'https://images.unsplash.com/photo-1565183997392-2f6f122e5912?w=1400&q=90&auto=format&fit=crop',
+  'Industrial-Home Office':'https://images.unsplash.com/photo-1497366216548-37526070297c?w=1400&q=90&auto=format&fit=crop',
+  'Industrial-Bedroom':   'https://images.unsplash.com/photo-1505693416388-ac5ce068fe85?w=1400&q=90&auto=format&fit=crop',
+  // Bohemian
+  'Bohemian-Living Room': 'https://images.unsplash.com/photo-1522444195799-478538b28823?w=1400&q=90&auto=format&fit=crop',
+  'Bohemian-Bedroom':     'https://images.unsplash.com/photo-1617325247661-675ab4b64ae2?w=1400&q=90&auto=format&fit=crop',
+  // Japandi
+  'Japandi-Living Room':  'https://images.unsplash.com/photo-1526057565006-20beab8dd2ed?w=1400&q=90&auto=format&fit=crop',
+  'Japandi-Bedroom':      'https://images.unsplash.com/photo-1617806118233-18e1de247200?w=1400&q=90&auto=format&fit=crop',
+  'Japandi-Bathroom':     'https://images.unsplash.com/photo-1600585154340-be6161a56a0c?w=1400&q=90&auto=format&fit=crop',
+  // Classic
+  'Classic-Living Room':  'https://images.unsplash.com/photo-1560448075-bb485b067938?w=1400&q=90&auto=format&fit=crop',
+  'Classic-Bedroom':      'https://images.unsplash.com/photo-1631049307264-da0ec9d70304?w=1400&q=90&auto=format&fit=crop',
+  'Classic-Dining Room':  'https://images.unsplash.com/photo-1615529162924-f8605388461d?w=1400&q=90&auto=format&fit=crop',
+  // Contemporary
+  'Contemporary-Living Room':'https://images.unsplash.com/photo-1600210492486-724fe5c67fb3?w=1400&q=90&auto=format&fit=crop',
+  'Contemporary-Bedroom': 'https://images.unsplash.com/photo-1616594039964-ae9021a400a0?w=1400&q=90&auto=format&fit=crop',
+  // Mediterranean
+  'Mediterranean-Living Room':'https://images.unsplash.com/photo-1558618666-fcd25c85cd64?w=1400&q=90&auto=format&fit=crop',
+  'Mediterranean-Bedroom':'https://images.unsplash.com/photo-1560448075-bb485b067938?w=1400&q=90&auto=format&fit=crop',
+  // Kids / Suite / Studio
+  'Kids Room':            'https://images.unsplash.com/photo-1598300042247-d088f8ab3a91?w=1400&q=90&auto=format&fit=crop',
+  'Master Suite':         'https://images.unsplash.com/photo-1631049307264-da0ec9d70304?w=1400&q=90&auto=format&fit=crop',
+  'Studio':               'https://images.unsplash.com/photo-1598928506311-c55ded91a20c?w=1400&q=90&auto=format&fit=crop',
+}
+
+function getFallbackImage(style: string, roomType: string): string {
+  // Try exact style+room match first
+  const key1 = `${style}-${roomType}`
+  if (FALLBACK_IMAGES[key1]) return FALLBACK_IMAGES[key1]
+  // Try just room type (any style)
+  const key2 = Object.keys(FALLBACK_IMAGES).find(k => k.endsWith(`-${roomType}`))
+  if (key2) return FALLBACK_IMAGES[key2]
+  // Try just room type without style prefix
+  if (FALLBACK_IMAGES[roomType]) return FALLBACK_IMAGES[roomType]
+  // Ultimate fallback — always a living room, never random
+  return 'https://images.unsplash.com/photo-1618219908412-a29a1bb7b86e?w=1400&q=90&auto=format&fit=crop'
 }
 
 // ─── MAIN HANDLER ─────────────────────────────────────────────────────────────
@@ -591,40 +650,78 @@ export async function POST(req: Request) {
     // exact position, color and material from the layout JSON
     const furnitureLine = layout.furniture
       .filter(f => f.type !== 'rug' && f.heightFt > 1.0)
-      .slice(0, 7)
+      .slice(0, 6)
       .map(f => {
         const pos = f.yFrac < 0.3 ? 'against far wall' : f.yFrac > 0.7 ? 'near foreground' : f.xFrac < 0.3 ? 'left side' : f.xFrac > 0.6 ? 'right side' : 'center'
         return `${f.label} (${f.color} ${f.material}, ${pos})`
       }).join(', ')
 
+    // Room-type-specific furniture guard — prevents wrong room type in render
+    const ROOM_MUST_HAVE: Record<string, string> = {
+      'Living Room':  'sofa, coffee table, TV unit',
+      'Bedroom':      'bed with headboard, bedside tables, wardrobe',
+      'Kitchen':      'kitchen cabinets, countertop, kitchen island',
+      'Bathroom':     'bathtub or shower, vanity sink, toilet, tiles',
+      'Home Office':  'large desk, office chair, bookshelves',
+      'Dining Room':  'dining table, dining chairs, sideboard',
+      'Kids Room':    'kids bed, study desk, toy shelves, colorful decor',
+      'Master Suite': 'king bed, chaise lounge, walk-in wardrobe',
+      'Studio':       'murphy bed, compact sofa, small dining table',
+    }
+    const mustHave = ROOM_MUST_HAVE[roomType] || ''
+
     const photoPrompt = [
-      `photorealistic interior design render of a ${style} ${roomType}`,
-      `${layout.dimensions.sqft} square feet, ${layout.dimensions.widthFt}ft wide by ${layout.dimensions.lengthFt}ft long`,
+      // State room type 3× at the start — most important signal for SDXL
+      `interior design photograph of a ${style} ${roomType}`,
+      `this is a ${roomType}, must show: ${mustHave}`,
+      `${style} style ${roomType} interior`,
+      // Dimensions
+      `room is ${layout.dimensions.widthFt}ft wide by ${layout.dimensions.lengthFt}ft long, ${layout.dimensions.sqft} sqft`,
       layout.dimensions.heightFt >= 10 ? `soaring ${layout.dimensions.heightFt}ft ceiling` : `${layout.dimensions.heightFt}ft ceiling`,
-      `room contains: ${furnitureLine}`,
-      `floor: ${layout.floor.material} in ${layout.floor.color}`,
-      `walls: ${layout.walls.color} ${layout.walls.material}`,
-      layout.walls.accentWall ? layout.walls.accentWall : '',
+      // Furniture from layout
+      `furniture: ${furnitureLine}`,
+      // Materials and surfaces
+      `${layout.floor.material} floor in ${layout.floor.color}`,
+      `${layout.walls.color} walls`,
+      layout.walls.accentWall || '',
+      // Style
       layout.styleDetails,
       `${layout.mood} atmosphere`,
       `lighting: ${layout.lighting.natural}, ${layout.lighting.ambient}`,
-      answers.mood     ? `${answers.mood} mood`     : '',
-      answers.material ? `${answers.material} materials` : '',
-      custom || '',
-      'wide angle architectural photography showing entire room from corner',
-      'Architectural Digest magazine quality, 8K photorealistic, perfect lighting, sharp focus',
-      'no people, no text, no watermarks',
+      answers.mood     ? `${answers.mood} mood`         : '',
+      answers.material ? `${answers.material} finishes`  : '',
+      custom           ? `additional: ${custom}`         : '',
+      // Quality
+      'wide angle architectural photography from corner showing full room',
+      'Architectural Digest quality, 8K photorealistic render, perfect lighting, sharp focus throughout',
+      'no people, no text, no watermarks, no outdoor',
     ].filter(Boolean).join('. ')
 
     const photoNegative = [
+      // Prevent wrong room type — specific per room
+      roomType === 'Bedroom'     ? 'no living room, no sofa, no coffee table, no TV unit'   : '',
+      roomType === 'Living Room' ? 'no bed, no headboard, no wardrobe, no bedroom furniture' : '',
+      roomType === 'Kitchen'     ? 'no bed, no sofa, no living room furniture'               : '',
+      roomType === 'Bathroom'    ? 'no bed, no sofa, no dining table'                        : '',
+      roomType === 'Home Office' ? 'no bed, no sofa, no dining table'                        : '',
+      roomType === 'Dining Room' ? 'no bed, no sofa, no bedroom furniture'                   : '',
       negative,
-      'no cartoon, no illustration, no painting, not blurry, not dark',
-      'not outdoor, not exterior',
-    ].join(', ')
+      'no cartoon, no illustration, no painting, not blurry, not dark, not overexposed',
+      'not outdoor, not exterior, not garden',
+    ].filter(Boolean).join(', ')
 
-    const photoImage = await generateImage(photoPrompt, photoNegative, 1344, 768)
-    const photoUrl   = photoImage || pollinationsFallback(photoPrompt, 1344, 768)
-    console.log('[Photo render]', photoImage ? 'Replicate success' : 'Pollinations fallback')
+    // Try Replicate — if fails, retry once with a simpler focused prompt
+    let photoImage = await generateImage(photoPrompt, photoNegative, 1344, 768)
+
+    if (!photoImage) {
+      console.log('[Photo render] Replicate failed, retrying with simpler prompt...')
+      const simplePrompt = `photorealistic interior design of a ${style} ${roomType} with ${mustHave}, ${layout.styleDetails}, wide angle photography, 8K, Architectural Digest quality, no people`
+      const simpleNeg    = `not a ${roomType === 'Bedroom' ? 'living room' : roomType === 'Living Room' ? 'bedroom' : 'wrong room'}, no people, no text, not blurry, not outdoor`
+      photoImage = await generateImage(simplePrompt, simpleNeg, 1024, 576)
+    }
+
+    const photoUrl = photoImage || getFallbackImage(style, roomType)
+    console.log('[Photo render]', photoImage ? 'Replicate success ✓' : `Using curated fallback for ${style} ${roomType}`)
 
     // ── STAGE 6: Return all 3 outputs ─────────────────────────────────────────
     return NextResponse.json({
