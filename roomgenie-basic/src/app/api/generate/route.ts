@@ -7,7 +7,7 @@
  * [2] LAYOUT PLANNING      — Claude generates structured RoomLayoutJSON
  * [3] FLOOR PLAN           — SVG generated deterministically from JSON (no AI needed)
  * [4] PROMPT BUILDING      — Render prompt built from JSON data (not guessed)
- * [5] IMAGE GENERATION     — Replicate SDXL renders from the precise prompt
+ * [5] IMAGE GENERATION     — OpenAI gpt-image-1 generates from the precise prompt
  * [6] RESPONSE             — Returns image, SVG floor plan, layout JSON, design metadata
  *
  * The key insight: both images derive from the SAME layout JSON,
@@ -507,99 +507,33 @@ function buildRenderPrompt(layout: RoomLayoutJSON): { prompt: string; negative: 
 
 // ─── STAGE 5: REPLICATE IMAGE GENERATION ─────────────────────────────────────
 
-async function generateImage(prompt: string, negative: string, _w: number, _h: number): Promise<string | null> {
-  const token = process.env.REPLICATE_API_TOKEN
-  if (!token) { console.log('[Replicate] No token'); return null }
+async function generateImage(prompt: string): Promise<string | null> {
+  const apiKey = process.env.OPENAI_API_KEY
+  if (!apiKey) { console.log('[OpenAI] No API key'); return null }
 
-  // Use adirik/interior-design — fine-tuned specifically for interior design renders
-  // Far better than SDXL at understanding room types, furniture, and architectural prompts
   try {
-    const resp = await fetch('https://api.replicate.com/v1/models/adirik/interior-design/predictions', {
-      method:  'POST',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type':  'application/json',
-        'Prefer':        'wait=60',
-      },
-      body: JSON.stringify({
-        input: {
-          prompt,
-          negative_prompt: negative,
-          guidance_scale:       15,
-          num_inference_steps:  50,
-          strength:             0.85,
-        }
-      })
+    const OpenAI = (await import('openai')).default
+    const openai = new OpenAI({ apiKey })
+
+    console.log('[OpenAI] Generating with gpt-image-1...')
+    const response = await openai.images.generate({
+      model:   'gpt-image-1',
+      prompt:  prompt.slice(0, 4000),
+      size:    '1536x1024',
+      quality: 'high',
+      n:       1,
     })
 
-    if (!resp.ok) {
-      console.error('[Replicate] interior-design error:', resp.status, await resp.text())
-      // Fall through to SDXL fallback below
-    } else {
-      const pred = await resp.json()
-      console.log('[Replicate] interior-design prediction:', pred.id, pred.status)
-
-      if (pred.status === 'succeeded' && pred.output?.[0]) return pred.output[0]
-
-      if (pred.id) {
-        for (let i = 0; i < 24; i++) {
-          await new Promise(r => setTimeout(r, 2500))
-          const poll   = await fetch(`https://api.replicate.com/v1/predictions/${pred.id}`, { headers: { 'Authorization': `Bearer ${token}` } })
-          const result = await poll.json()
-          if (result.status === 'succeeded' && result.output?.[0]) {
-            console.log('[Replicate] interior-design success ✓')
-            return result.output[0]
-          }
-          if (result.status === 'failed' || result.status === 'canceled') {
-            console.error('[Replicate] interior-design failed:', result.error)
-            break
-          }
-        }
-      }
-    }
-
-    // Fallback: try SDXL with the same prompt
-    console.log('[Replicate] Falling back to SDXL...')
-    const resp2 = await fetch('https://api.replicate.com/v1/models/stability-ai/sdxl/predictions', {
-      method:  'POST',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type':  'application/json',
-        'Prefer':        'wait=60',
-      },
-      body: JSON.stringify({
-        input: {
-          prompt,
-          negative_prompt:     negative,
-          width:                1344,
-          height:               768,
-          num_inference_steps:  40,
-          guidance_scale:       9,
-          refine:               'expert_ensemble_refiner',
-          high_noise_frac:      0.8,
-          apply_watermark:      false,
-        }
-      })
-    })
-
-    if (!resp2.ok) { console.error('[Replicate] SDXL error:', resp2.status); return null }
-
-    const pred2 = await resp2.json()
-    if (pred2.status === 'succeeded' && pred2.output?.[0]) return pred2.output[0]
-    if (!pred2.id) return null
-
-    for (let i = 0; i < 20; i++) {
-      await new Promise(r => setTimeout(r, 2500))
-      const poll   = await fetch(`https://api.replicate.com/v1/predictions/${pred2.id}`, { headers: { 'Authorization': `Bearer ${token}` } })
-      const result = await poll.json()
-      if (result.status === 'succeeded' && result.output?.[0]) {
-        console.log('[Replicate] SDXL fallback success ✓')
-        return result.output[0]
-      }
-      if (result.status === 'failed' || result.status === 'canceled') { console.error('[SDXL] Failed:', result.error); return null }
-    }
+    const item = response.data?.[0]
+    if (!item) return null
+    if (item.b64_json) return `data:image/png;base64,${item.b64_json}`
+    if (item.url)      return item.url
     return null
-  } catch (e) { console.error('[Replicate] Exception:', e); return null }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.error('[OpenAI] Error:', msg)
+    return null
+  }
 }
 
 // Curated direct Unsplash images — keyed by "Style-RoomType"
@@ -707,7 +641,7 @@ export async function POST(req: Request) {
     const { prompt, negative } = buildRenderPrompt(layout)
     console.log('[Prompt]', prompt.slice(0, 120))
 
-    // ── STAGE 5: Generate photorealistic render (Replicate SDXL) ─────────────
+    // ── STAGE 5: Generate photorealistic render (OpenAI gpt-image-1) ─────────────
     // This is the "real room" image — same furniture/colors/layout as the 3D viewer
     // Build an ultra-specific prompt that lists every piece of furniture with its
     // exact position, color and material from the layout JSON
@@ -754,35 +688,21 @@ export async function POST(req: Request) {
       'interior design photography, wide angle, entire room visible, professional lighting, photorealistic, 8K',
     ].filter(Boolean).join(', ')
 
-    const photoNegative = [
-      // Prevent wrong room type — specific per room
-      roomType === 'Bedroom'     ? 'no living room, no sofa, no coffee table, no TV unit'   : '',
-      roomType === 'Living Room' ? 'no bed, no headboard, no wardrobe, no bedroom furniture' : '',
-      roomType === 'Kitchen'     ? 'no bed, no sofa, no living room furniture'               : '',
-      roomType === 'Bathroom'    ? 'no bed, no sofa, no dining table'                        : '',
-      roomType === 'Home Office' ? 'no bed, no sofa, no dining table'                        : '',
-      roomType === 'Dining Room' ? 'no bed, no sofa, no bedroom furniture'                   : '',
-      negative,
-      'no cartoon, no illustration, no painting, not blurry, not dark, not overexposed',
-      'not outdoor, not exterior, not garden',
-    ].filter(Boolean).join(', ')
-
-    // Try Replicate — if fails, retry once with a simpler focused prompt
-    let photoImage = await generateImage(photoPrompt, photoNegative, 1344, 768)
+    // Try OpenAI gpt-image-1 — if fails, retry with simpler prompt
+    let photoImage = await generateImage(photoPrompt)
 
     if (!photoImage) {
-      console.log('[Photo render] Replicate failed, retrying with simpler prompt...')
-      const simplePrompt = `photorealistic interior design of a ${style} ${roomType} with ${mustHave}, ${layout.styleDetails}, wide angle photography, 8K, Architectural Digest quality, no people`
-      const simpleNeg    = `not a ${roomType === 'Bedroom' ? 'living room' : roomType === 'Living Room' ? 'bedroom' : 'wrong room'}, no people, no text, not blurry, not outdoor`
-      photoImage = await generateImage(simplePrompt, simpleNeg, 1024, 576)
+      console.log('[OpenAI] First attempt failed, retrying with simpler prompt...')
+      const simplePrompt = `${style} ${roomType} interior design, ${mustHave}, ${layout.styleDetails}, wide angle architectural photography, photorealistic, 8K quality, no people`
+      photoImage = await generateImage(simplePrompt)
     }
 
     const photoUrl = photoImage || getFallbackImage(style, roomType)
-    console.log('[Photo render]', photoImage ? 'Replicate success ✓' : `Using curated fallback for ${style} ${roomType}`)
+    console.log('[Photo render]', photoImage ? 'OpenAI gpt-image-1 success ✓' : `Using curated fallback for ${style} ${roomType}`)
 
     // ── STAGE 6: Return all 3 outputs ─────────────────────────────────────────
     return NextResponse.json({
-      // Output 1: Photorealistic render (Replicate SDXL)
+      // Output 1: Photorealistic render (OpenAI gpt-image-1)
       image:     photoUrl,
       // Output 2: SVG floor plan (deterministic from JSON)
       floorPlan: floorPlanDataUrl,
