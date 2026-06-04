@@ -2,7 +2,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import Link from 'next/link'
 
-/* ─── INLINE 3D ROOM VIEWER (Three.js, no external component) ───── */
+/* ─── TYPES ───────────────────────────────────────────────────────── */
 type LayoutJSON = {
   dimensions: { widthFt: number; lengthFt: number; heightFt: number; sqft: number }
   furniture:  Array<{ id: string; type: string; label: string; color: string; material: string; xFrac: number; yFrac: number; wFrac: number; dFrac: number; heightFt: number; rotation: number; preserved: boolean; notes: string }>
@@ -17,49 +17,59 @@ function hexToRgb(hex: string): [number, number, number] {
   return [parseInt(h.slice(0,2),16)/255, parseInt(h.slice(2,4),16)/255, parseInt(h.slice(4,6),16)/255]
 }
 
+/* ─── 3D ROOM VIEWER ─────────────────────────────────────────────── */
 function RoomViewer3D({ layoutJSON, style, roomType }: { layoutJSON: LayoutJSON; style: string; roomType: string }) {
-  const canvasRef   = useRef<HTMLCanvasElement>(null)
-  const rafRef      = useRef<number>(0)
-  const angleRef    = useRef(0.5)
-  const vertRef     = useRef(0.38)
-  const dragging    = useRef(false)
-  const lastPos     = useRef({ x: 0, y: 0 })
-  const autoRef     = useRef(true)
-  const [auto, setAuto] = useState(true)
+  const mountRef  = useRef<HTMLDivElement>(null)
+  const rafRef    = useRef<number>(0)
+  const angleRef  = useRef(0.5)
+  const vertRef   = useRef(0.38)
+  const dragging  = useRef(false)
+  const lastPos   = useRef({ x: 0, y: 0 })
+  const autoRef   = useRef(true)
+  const [auto, setAuto]   = useState(true)
   const [ready, setReady] = useState(false)
 
   useEffect(() => {
-    const canvas = canvasRef.current
-    if (!canvas) return
+    const mount = mountRef.current
+    if (!mount) return
     let disposed = false
+    let raf = 0
 
     ;(async () => {
       const THREE = await import('three')
       if (disposed) return
 
+      const W_PX = mount.offsetWidth || 500
+      const H_PX = 360
+
+      // Create canvas programmatically — avoids SSR clientWidth=0 issue
+      const canvas = document.createElement('canvas')
+      canvas.style.cssText = `width:100%;height:${H_PX}px;display:block;cursor:grab;`
+      mount.appendChild(canvas)
+      if (disposed) { mount.removeChild(canvas); return }
+
       const { widthFt: W, lengthFt: L, heightFt: H } = layoutJSON.dimensions
       const cx = W / 2, cz = L / 2
 
-      const renderer = new THREE.WebGLRenderer({ canvas, antialias: true })
-      renderer.setSize(canvas.clientWidth || 680, canvas.clientHeight || 340)
+      const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' })
+      renderer.setSize(W_PX, H_PX)
       renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
       renderer.shadowMap.enabled = true
-      renderer.shadowMap.type = THREE.PCFSoftShadowMap
-      renderer.toneMapping = THREE.ACESFilmicToneMapping
+      renderer.shadowMap.type    = THREE.PCFSoftShadowMap
+      renderer.toneMapping       = THREE.ACESFilmicToneMapping
       renderer.toneMappingExposure = 1.1
 
       const scene  = new THREE.Scene()
-      const bgRgb  = hexToRgb('#e8eeff')
-      scene.background = new THREE.Color(...bgRgb)
+      scene.background = new THREE.Color(0xe8ecff)
 
-      const camera = new THREE.PerspectiveCamera(52, (canvas.clientWidth||680)/(canvas.clientHeight||340), 0.1, 300)
-      const dist   = Math.max(W, L) * 1.15
+      const camera = new THREE.PerspectiveCamera(52, W_PX / H_PX, 0.1, 300)
+      const dist   = Math.max(W, L) * 1.2
 
       function updateCam() {
         const a = angleRef.current, v = vertRef.current
         camera.position.set(
           cx + dist * Math.sin(a) * Math.cos(v),
-          H * 0.4 + dist * Math.sin(v),
+          H  * 0.4  + dist * Math.sin(v),
           cz + dist * Math.cos(a) * Math.cos(v)
         )
         camera.lookAt(cx, H * 0.25, cz)
@@ -67,247 +77,217 @@ function RoomViewer3D({ layoutJSON, style, roomType }: { layoutJSON: LayoutJSON;
       updateCam()
 
       // Lights
-      scene.add(new THREE.AmbientLight(0xffffff, 0.65))
-      const sun = new THREE.DirectionalLight(0xfff5e0, 1.9)
-      sun.position.set(W * 0.7, H * 2, L * 0.4)
+      scene.add(new THREE.AmbientLight(0xffffff, 0.68))
+      const sun = new THREE.DirectionalLight(0xfff5e0, 1.85)
+      sun.position.set(W * 0.7, H * 2.2, L * 0.4)
       sun.castShadow = true
       sun.shadow.mapSize.set(2048, 2048)
-      sun.shadow.camera.left = -W * 1.5; sun.shadow.camera.right  =  W * 1.5
-      sun.shadow.camera.top  =  L * 1.5; sun.shadow.camera.bottom = -L * 1.5
+      sun.shadow.camera.left   = -W * 1.5
+      sun.shadow.camera.right  =  W * 1.5
+      sun.shadow.camera.top    =  L * 1.5
+      sun.shadow.camera.bottom = -L * 1.5
       sun.shadow.bias = -0.001
       scene.add(sun)
-      scene.add(Object.assign(new THREE.DirectionalLight(0xffd0a0, 0.35), { position: new THREE.Vector3(-W * 0.5, H * 0.4, -L * 0.6) }))
+      const fill = new THREE.DirectionalLight(0xffd0a0, 0.35)
+      fill.position.set(-W * 0.5, H * 0.4, -L * 0.6)
+      scene.add(fill)
 
-      // Room shell
-      function mat(color: string, roughness = 0.85, metalness = 0) {
+      // Helpers
+      function mkMat(color: string, roughness = 0.85, metalness = 0) {
         return new THREE.MeshStandardMaterial({ color: new THREE.Color(...hexToRgb(color)), roughness, metalness })
       }
-      const wallM  = mat(layoutJSON.walls.color  || '#F5F2ED', 0.92)
-      const floorM = mat(layoutJSON.floor.color  || '#C4A882', layoutJSON.floor.material === 'marble' ? 0.12 : 0.75, layoutJSON.floor.material === 'marble' ? 0.05 : 0)
-      const ceilM  = mat('#FFFFFF', 0.95)
-
-      function box(w: number, h: number, d: number, x: number, y: number, z: number, m: import('three').Material, shadow = true) {
+      function addBox(w: number, h: number, d: number, x: number, y: number, z: number, m: import('three').Material, sh = true) {
         const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m)
         mesh.position.set(x, y, z)
-        if (shadow) { mesh.castShadow = true; mesh.receiveShadow = true }
-        scene.add(mesh)
-        return mesh
+        if (sh) { mesh.castShadow = true; mesh.receiveShadow = true }
+        scene.add(mesh); return mesh
       }
 
-      // Floor + ceiling
+      // Room shell
+      const wallM  = mkMat(layoutJSON.walls.color  || '#F5F2ED', 0.92)
+      const floorM = mkMat(layoutJSON.floor.color  || '#C4A882', layoutJSON.floor.material === 'marble' ? 0.12 : 0.75, layoutJSON.floor.material === 'marble' ? 0.05 : 0)
+      const ceilM  = mkMat('#FAFAFA', 0.95)
+
       const fl = new THREE.Mesh(new THREE.PlaneGeometry(W, L), floorM)
       fl.rotation.x = -Math.PI / 2; fl.position.set(cx, 0, cz); fl.receiveShadow = true; scene.add(fl)
       const cl = new THREE.Mesh(new THREE.PlaneGeometry(W, L), ceilM)
-      cl.rotation.x = Math.PI / 2; cl.position.set(cx, H, cz); scene.add(cl)
+      cl.rotation.x =  Math.PI / 2; cl.position.set(cx, H, cz); scene.add(cl)
 
-      // Walls
-      box(W, H, 0.18, cx, H/2, 0,  wallM)   // back
-      box(W, H, 0.18, cx, H/2, L,  wallM)   // front (partial view)
-      box(0.18, H, L, 0,  H/2, cz, wallM)   // left
-      box(0.18, H, L, W,  H/2, cz, wallM)   // right
+      addBox(W, H, 0.18, cx, H/2, 0, wallM)                       // back wall
+      addBox(0.18, H, L,  0,  H/2, cz, wallM)                     // left wall
+      addBox(0.18, H, L,  W,  H/2, cz, wallM)                     // right wall
+      // Front wall with gap so we can see inside
+      addBox(W * 0.22, H, 0.18, W * 0.11, H/2, L, wallM)
+      addBox(W * 0.22, H, 0.18, W * 0.89, H/2, L, wallM)
+      addBox(W * 0.56, H * 0.26, 0.18, cx, H * 0.87, L, wallM)
       // Skirting
-      const skM = mat('#F8F8F8', 0.6)
-      box(W, 0.2, 0.08, cx, 0.1, 0.04, skM, false)
-      box(0.08, 0.2, L, 0.04, 0.1, cz,  skM, false)
-      box(0.08, 0.2, L, W - 0.04, 0.1, cz, skM, false)
-      // Window on right wall
-      const glassM = new THREE.MeshStandardMaterial({ color: new THREE.Color(0.7, 0.88, 1), roughness: 0.05, metalness: 0.1, transparent: true, opacity: 0.28 })
-      const winH = H * 0.52, winD = L * 0.32
-      const win = new THREE.Mesh(new THREE.BoxGeometry(0.06, winH, winD), glassM)
+      const skM = mkMat('#F8F8F8', 0.6)
+      addBox(W, 0.18, 0.07, cx, 0.09, 0.04, skM, false)
+      addBox(0.07, 0.18, L, 0.04, 0.09, cz, skM, false)
+      addBox(0.07, 0.18, L, W - 0.04, 0.09, cz, skM, false)
+      // Window
+      const glassM = new THREE.MeshStandardMaterial({ color: new THREE.Color(0.7, 0.88, 1), roughness: 0.05, transparent: true, opacity: 0.28 })
+      const win = new THREE.Mesh(new THREE.BoxGeometry(0.06, H * 0.52, L * 0.32), glassM)
       win.position.set(W, H * 0.56, cz); scene.add(win)
 
       // Furniture
       layoutJSON.furniture.forEach(f => {
-        const fw = f.wFrac * W, fd2 = f.dFrac * L, fh = Math.max(f.heightFt, 0.12)
-        const x = f.xFrac * W, z = f.yFrac * L
+        const fw = Math.max(f.wFrac * W, 0.1)
+        const fd = Math.max(f.dFrac * L, 0.1)
+        const fh = Math.max(f.heightFt, 0.12)
+        const x  = f.xFrac * W
+        const z  = f.yFrac * L
         const [r, g, b] = hexToRgb(f.color || '#8B8680')
-        const matProp = { roughness: 0.82, metalness: 0 }
-        if (['metal','glass','marble'].includes((f.material||'').toLowerCase().split(/\s/)[0])) {
-          matProp.roughness = 0.2; matProp.metalness = 0.7
-        }
-        const fm = new THREE.MeshStandardMaterial({ color: new THREE.Color(r, g, b), ...matProp })
+        const hard = ['metal','glass','marble','ceramic'].includes((f.material||'').toLowerCase().split(/[\s,]/)[0])
+        const fm = new THREE.MeshStandardMaterial({ color: new THREE.Color(r,g,b), roughness: hard ? 0.2 : 0.82, metalness: hard ? 0.6 : 0 })
         const grp = new THREE.Group()
 
         if (f.type === 'rug') {
-          const rug = new THREE.Mesh(new THREE.BoxGeometry(fw, 0.04, fd2), fm)
-          rug.position.set(fw/2, 0.02, fd2/2); rug.receiveShadow = true; grp.add(rug)
+          const rg = new THREE.Mesh(new THREE.BoxGeometry(fw,0.04,fd), fm); rg.position.set(fw/2,0.02,fd/2); rg.receiveShadow=true; grp.add(rg)
+
         } else if (f.type === 'sofa' || f.type === 'chaise') {
-          const seat = new THREE.Mesh(new THREE.BoxGeometry(fw, fh*0.44, fd2*0.7), fm)
-          seat.position.set(fw/2, fh*0.22, fd2*0.38); seat.castShadow = true; grp.add(seat)
-          const back = new THREE.Mesh(new THREE.BoxGeometry(fw, fh*0.62, fd2*0.22), fm)
-          back.position.set(fw/2, fh*0.35, fd2*0.11); back.castShadow = true; grp.add(back)
-          ;[0.05, 0.95].forEach(ax => {
-            const arm = new THREE.Mesh(new THREE.BoxGeometry(fw*0.09, fh*0.5, fd2*0.7), fm)
-            arm.position.set(fw*ax, fh*0.28, fd2*0.38); arm.castShadow = true; grp.add(arm)
-          })
-          const legM2 = new THREE.MeshStandardMaterial({ color: new THREE.Color(0.18,0.12,0.08), roughness: 0.5 })
-          ;[[0.1,0.88],[0.9,0.88]].forEach(([lx,lz]) => {
-            const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.04,0.04,fh*0.11,6), legM2)
-            leg.position.set(fw*lx, fh*0.055, fd2*lz); grp.add(leg)
-          })
+          const seat = new THREE.Mesh(new THREE.BoxGeometry(fw,fh*.44,fd*.7),fm); seat.position.set(fw/2,fh*.22,fd*.38); seat.castShadow=seat.receiveShadow=true; grp.add(seat)
+          const bk = new THREE.Mesh(new THREE.BoxGeometry(fw,fh*.62,fd*.22),fm); bk.position.set(fw/2,fh*.35,fd*.11); bk.castShadow=true; grp.add(bk)
+          ;[0.05,0.95].forEach(ax=>{ const arm=new THREE.Mesh(new THREE.BoxGeometry(fw*.09,fh*.5,fd*.7),fm); arm.position.set(fw*ax,fh*.28,fd*.38); arm.castShadow=true; grp.add(arm) })
+          const lm=new THREE.MeshStandardMaterial({color:new THREE.Color(.18,.12,.08),roughness:.5})
+          ;[[.1,.88],[.9,.88],[.1,.12],[.9,.12]].forEach(([lx,lz])=>{ const lg=new THREE.Mesh(new THREE.CylinderGeometry(.04,.04,fh*.11,6),lm); lg.position.set(fw*lx,fh*.055,fd*lz); grp.add(lg) })
+
         } else if (f.type === 'bed' || f.type === 'murphy_bed') {
-          const base5 = new THREE.Mesh(new THREE.BoxGeometry(fw, fh*0.26, fd2), fm)
-          base5.position.set(fw/2, fh*0.13, fd2/2); base5.castShadow = base5.receiveShadow = true; grp.add(base5)
-          const mMat = new THREE.MeshStandardMaterial({ color: new THREE.Color(0.97,0.95,0.92), roughness: 0.96 })
-          const matt = new THREE.Mesh(new THREE.BoxGeometry(fw*0.93, fh*0.16, fd2*0.93), mMat)
-          matt.position.set(fw/2, fh*0.35, fd2/2); matt.castShadow = true; grp.add(matt)
-          const hb2 = new THREE.Mesh(new THREE.BoxGeometry(fw, fh*0.65, fd2*0.12), fm)
-          hb2.position.set(fw/2, fh*0.46, fd2*0.06); hb2.castShadow = true; grp.add(hb2)
-          const pilM = new THREE.MeshStandardMaterial({ color: new THREE.Color(0.96,0.96,0.99), roughness: 0.96 })
-          ;[0.28, 0.72].forEach(px => {
-            const pil = new THREE.Mesh(new THREE.BoxGeometry(fw*0.27, fh*0.11, fd2*0.17), pilM)
-            pil.position.set(fw*px, fh*0.5, fd2*0.21); pil.castShadow = true; grp.add(pil)
-          })
-          const duv = new THREE.Mesh(new THREE.BoxGeometry(fw*0.91, fh*0.07, fd2*0.61), new THREE.MeshStandardMaterial({ color: new THREE.Color(0.92,0.89,0.85), roughness: 0.98 }))
-          duv.position.set(fw/2, fh*0.48, fd2*0.59); grp.add(duv)
+          const bs=new THREE.Mesh(new THREE.BoxGeometry(fw,fh*.26,fd),fm); bs.position.set(fw/2,fh*.13,fd/2); bs.castShadow=bs.receiveShadow=true; grp.add(bs)
+          const mm=new THREE.MeshStandardMaterial({color:new THREE.Color(.97,.95,.92),roughness:.96})
+          const mt=new THREE.Mesh(new THREE.BoxGeometry(fw*.93,fh*.16,fd*.93),mm); mt.position.set(fw/2,fh*.35,fd/2); mt.castShadow=true; grp.add(mt)
+          const hb=new THREE.Mesh(new THREE.BoxGeometry(fw,fh*.65,fd*.12),fm); hb.position.set(fw/2,fh*.46,fd*.06); hb.castShadow=true; grp.add(hb)
+          const pm=new THREE.MeshStandardMaterial({color:new THREE.Color(.96,.96,.99),roughness:.96})
+          ;[.28,.72].forEach(px=>{ const p=new THREE.Mesh(new THREE.BoxGeometry(fw*.27,fh*.11,fd*.17),pm); p.position.set(fw*px,fh*.5,fd*.21); p.castShadow=true; grp.add(p) })
+          const dv=new THREE.Mesh(new THREE.BoxGeometry(fw*.91,fh*.07,fd*.61),new THREE.MeshStandardMaterial({color:new THREE.Color(.92,.89,.85),roughness:.98})); dv.position.set(fw/2,fh*.48,fd*.59); grp.add(dv)
+          const lm2=new THREE.MeshStandardMaterial({color:new THREE.Color(.22,.16,.1),roughness:.5})
+          ;[[.06,.94],[.94,.94],[.06,.06],[.94,.06]].forEach(([lx,lz])=>{ const lg=new THREE.Mesh(new THREE.CylinderGeometry(.045,.045,fh*.18,8),lm2); lg.position.set(fw*lx,fh*.09,fd*lz); grp.add(lg) })
+
         } else if (['dining_table','coffee_table','island','desk'].includes(f.type)) {
-          const top3 = new THREE.Mesh(new THREE.BoxGeometry(fw, fh*0.07, fd2), fm)
-          top3.position.set(fw/2, fh, fd2/2); top3.castShadow = top3.receiveShadow = true; grp.add(top3)
-          if (f.type !== 'desk') {
-            ;[[0.08,0.08],[0.92,0.08],[0.08,0.92],[0.92,0.92]].forEach(([lx,lz]) => {
-              const leg = new THREE.Mesh(new THREE.BoxGeometry(fw*0.07, fh*0.92, fw*0.07), fm)
-              leg.position.set(fw*lx, fh*0.46, fd2*lz); leg.castShadow = true; grp.add(leg)
-            })
+          const tp=new THREE.Mesh(new THREE.BoxGeometry(fw,fh*.07,fd),fm); tp.position.set(fw/2,fh,fd/2); tp.castShadow=tp.receiveShadow=true; grp.add(tp)
+          if(f.type==='desk'){
+            ;[.08,.92].forEach(lx=>{ const sp=new THREE.Mesh(new THREE.BoxGeometry(fw*.07,fh*.92,fd),fm); sp.position.set(fw*lx,fh*.46,fd/2); sp.castShadow=true; grp.add(sp) })
           } else {
-            ;[0.08, 0.92].forEach(lx => {
-              const sp3 = new THREE.Mesh(new THREE.BoxGeometry(fw*0.07, fh*0.92, fd2), fm)
-              sp3.position.set(fw*lx, fh*0.46, fd2/2); sp3.castShadow = true; grp.add(sp3)
-            })
+            ;[[.08,.08],[.92,.08],[.08,.92],[.92,.92]].forEach(([lx,lz])=>{ const lg=new THREE.Mesh(new THREE.BoxGeometry(fw*.07,fh*.92,fw*.07),fm); lg.position.set(fw*lx,fh*.46,fd*lz); lg.castShadow=true; grp.add(lg) })
           }
+
         } else if (['chair','armchair','dining_chair','stool'].includes(f.type)) {
-          const seat3 = new THREE.Mesh(new THREE.BoxGeometry(fw, fh*0.4, fd2*0.82), fm)
-          seat3.position.set(fw/2, fh*0.42, fd2*0.52); seat3.castShadow = seat3.receiveShadow = true; grp.add(seat3)
-          if (f.type !== 'stool') {
-            const back3 = new THREE.Mesh(new THREE.BoxGeometry(fw, fh*0.52, fd2*0.1), fm)
-            back3.position.set(fw/2, fh*0.68, fd2*0.05); back3.castShadow = true; grp.add(back3)
-          }
-          ;[[0.15,0.1],[0.85,0.1],[0.15,0.9],[0.85,0.9]].forEach(([lx,lz]) => {
-            const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.03,0.03,fh*0.4,6), fm)
-            leg.position.set(fw*lx, fh*0.2, fd2*lz); grp.add(leg)
-          })
+          const st=new THREE.Mesh(new THREE.BoxGeometry(fw,fh*.4,fd*.82),fm); st.position.set(fw/2,fh*.42,fd*.52); st.castShadow=st.receiveShadow=true; grp.add(st)
+          if(f.type!=='stool'){ const bk=new THREE.Mesh(new THREE.BoxGeometry(fw,fh*.52,fd*.1),fm); bk.position.set(fw/2,fh*.68,fd*.05); bk.castShadow=true; grp.add(bk) }
+          ;[[.15,.1],[.85,.1],[.15,.9],[.85,.9]].forEach(([lx,lz])=>{ const lg=new THREE.Mesh(new THREE.CylinderGeometry(.03,.03,fh*.4,6),fm); lg.position.set(fw*lx,fh*.2,fd*lz); grp.add(lg) })
+
         } else if (['bookshelf','shelving','wardrobe','sideboard','tv_unit','cabinets_lower'].includes(f.type)) {
-          const body2 = new THREE.Mesh(new THREE.BoxGeometry(fw, fh, fd2), fm)
-          body2.position.set(fw/2, fh/2, fd2/2); body2.castShadow = body2.receiveShadow = true; grp.add(body2)
-          const shM = new THREE.MeshStandardMaterial({ color: new THREE.Color(r*1.1,g*1.1,b*1.1), roughness: 0.8 })
-          const shCount = Math.max(1, Math.floor(fh/1.2))
-          for (let s = 1; s < shCount; s++) {
-            const sh = new THREE.Mesh(new THREE.BoxGeometry(fw*0.94, 0.05, fd2*0.86), shM)
-            sh.position.set(fw/2, (fh/shCount)*s, fd2/2); grp.add(sh)
+          const bd=new THREE.Mesh(new THREE.BoxGeometry(fw,fh,fd),fm); bd.position.set(fw/2,fh/2,fd/2); bd.castShadow=bd.receiveShadow=true; grp.add(bd)
+          const shM=new THREE.MeshStandardMaterial({color:new THREE.Color(Math.min(r*1.15,1),Math.min(g*1.15,1),Math.min(b*1.15,1)),roughness:.8})
+          const sc=Math.max(1,Math.floor(fh/1.2))
+          for(let s=1;s<sc;s++){ const sh=new THREE.Mesh(new THREE.BoxGeometry(fw*.94,.05,fd*.86),shM); sh.position.set(fw/2,(fh/sc)*s,fd/2); grp.add(sh) }
+          if(f.type==='tv_unit'){
+            const tvM=new THREE.MeshStandardMaterial({color:new THREE.Color(.04,.04,.07),roughness:.05,metalness:.85})
+            const tv=new THREE.Mesh(new THREE.BoxGeometry(fw*.85,fh*1.05,.07),tvM); tv.position.set(fw/2,fh*1.3,fd*.04); tv.castShadow=true; grp.add(tv)
+            const scM=new THREE.MeshStandardMaterial({color:new THREE.Color(.08,.12,.28),emissive:new THREE.Color(.04,.07,.15),emissiveIntensity:.7})
+            const sc2=new THREE.Mesh(new THREE.BoxGeometry(fw*.79,fh*.96,.02),scM); sc2.position.set(fw/2,fh*1.3,fd*.02); grp.add(sc2)
           }
-          if (f.type === 'tv_unit') {
-            const tvM = new THREE.MeshStandardMaterial({ color: new THREE.Color(0.04,0.04,0.07), roughness: 0.05, metalness: 0.85 })
-            const tv2 = new THREE.Mesh(new THREE.BoxGeometry(fw*0.85, fh*1.05, 0.07), tvM)
-            tv2.position.set(fw/2, fh*1.3, fd2*0.04); tv2.castShadow = true; grp.add(tv2)
-            const scM = new THREE.MeshStandardMaterial({ color: new THREE.Color(0.08,0.12,0.28), emissive: new THREE.Color(0.04,0.07,0.15), emissiveIntensity: 0.7, roughness: 0.04 })
-            const sc = new THREE.Mesh(new THREE.BoxGeometry(fw*0.79, fh*0.96, 0.02), scM)
-            sc.position.set(fw/2, fh*1.3, fd2*0.02); grp.add(sc)
-          }
-        } else if (f.type === 'nightstand' || f.type === 'side_table' || f.type === 'dresser') {
-          const body3 = new THREE.Mesh(new THREE.BoxGeometry(fw, fh*0.84, fd2), fm)
-          body3.position.set(fw/2, fh*0.42, fd2/2); body3.castShadow = body3.receiveShadow = true; grp.add(body3)
-          const topM3 = new THREE.MeshStandardMaterial({ color: new THREE.Color(r*1.12,g*1.12,b*1.12), roughness: 0.35 })
-          const top4 = new THREE.Mesh(new THREE.BoxGeometry(fw*1.02, fh*0.07, fd2*1.02), topM3)
-          top4.position.set(fw/2, fh*0.875, fd2/2); grp.add(top4)
-          // Lamp
-          const lpM = new THREE.MeshStandardMaterial({ color: new THREE.Color(0.22,0.16,0.10), roughness: 0.4, metalness: 0.3 })
-          const lpBase4 = new THREE.Mesh(new THREE.CylinderGeometry(fw*0.1,fw*0.13,fh*0.06,10), lpM)
-          lpBase4.position.set(fw*0.68, fh*0.94, fd2*0.48); grp.add(lpBase4)
-          const shadeM = new THREE.MeshStandardMaterial({ color: new THREE.Color(0.96,0.88,0.7), roughness: 0.9, side: THREE.DoubleSide, emissive: new THREE.Color(0.28,0.18,0.04), emissiveIntensity: 0.45 })
-          const shade2 = new THREE.Mesh(new THREE.CylinderGeometry(fw*0.2,fw*0.26,fh*0.26,12,1,true), shadeM)
-          shade2.position.set(fw*0.68, fh*1.14, fd2*0.48); grp.add(shade2)
+
+        } else if (['nightstand','side_table','dresser'].includes(f.type)) {
+          const bd=new THREE.Mesh(new THREE.BoxGeometry(fw,fh*.84,fd),fm); bd.position.set(fw/2,fh*.42,fd/2); bd.castShadow=bd.receiveShadow=true; grp.add(bd)
+          const tM=new THREE.MeshStandardMaterial({color:new THREE.Color(Math.min(r*1.12,1),Math.min(g*1.12,1),Math.min(b*1.12,1)),roughness:.35})
+          const tp=new THREE.Mesh(new THREE.BoxGeometry(fw*1.02,fh*.07,fd*1.02),tM); tp.position.set(fw/2,fh*.875,fd/2); grp.add(tp)
+          const lpM=new THREE.MeshStandardMaterial({color:new THREE.Color(.22,.16,.1),roughness:.4,metalness:.3})
+          const lpB=new THREE.Mesh(new THREE.CylinderGeometry(fw*.1,fw*.13,fh*.06,10),lpM); lpB.position.set(fw*.68,fh*.94,fd*.48); grp.add(lpB)
+          const sdM=new THREE.MeshStandardMaterial({color:new THREE.Color(.96,.88,.7),roughness:.9,side:THREE.DoubleSide,emissive:new THREE.Color(.28,.18,.04),emissiveIntensity:.45})
+          const sd=new THREE.Mesh(new THREE.CylinderGeometry(fw*.2,fw*.26,fh*.26,12,1,true),sdM); sd.position.set(fw*.68,fh*1.14,fd*.48); grp.add(sd)
+
         } else if (f.type === 'floor_lamp') {
-          const poleM = new THREE.MeshStandardMaterial({ color: new THREE.Color(0.75,0.65,0.45), roughness: 0.3, metalness: 0.65 })
-          const pole2 = new THREE.Mesh(new THREE.CylinderGeometry(0.04,0.04,fh*0.87,8), poleM)
-          pole2.position.set(fw/2, fh*0.435, fd2/2); pole2.castShadow = true; grp.add(pole2)
-          const lsM = new THREE.MeshStandardMaterial({ color: new THREE.Color(0.96,0.89,0.74), roughness: 0.9, side: THREE.DoubleSide, emissive: new THREE.Color(0.26,0.16,0.03), emissiveIntensity: 0.5 })
-          const ls = new THREE.Mesh(new THREE.CylinderGeometry(fw*0.55,fw*0.75,fh*0.2,14,1,true), lsM)
-          ls.position.set(fw/2, fh*0.9, fd2/2); grp.add(ls)
-          const base6 = new THREE.Mesh(new THREE.CylinderGeometry(fw*0.35,fw*0.4,0.07,12), poleM)
-          base6.position.set(fw/2, 0.035, fd2/2); grp.add(base6)
+          const pM=new THREE.MeshStandardMaterial({color:new THREE.Color(.75,.65,.45),roughness:.3,metalness:.65})
+          const pl=new THREE.Mesh(new THREE.CylinderGeometry(.04,.04,fh*.87,8),pM); pl.position.set(fw/2,fh*.435,fd/2); pl.castShadow=true; grp.add(pl)
+          const lsM=new THREE.MeshStandardMaterial({color:new THREE.Color(.96,.89,.74),roughness:.9,side:THREE.DoubleSide,emissive:new THREE.Color(.26,.16,.03),emissiveIntensity:.5})
+          const ls=new THREE.Mesh(new THREE.CylinderGeometry(fw*.55,fw*.75,fh*.2,14,1,true),lsM); ls.position.set(fw/2,fh*.9,fd/2); grp.add(ls)
+          const bsM=new THREE.Mesh(new THREE.CylinderGeometry(fw*.35,fw*.4,.07,12),pM); bsM.position.set(fw/2,.035,fd/2); grp.add(bsM)
+
         } else if (f.type === 'bathtub') {
-          const outer2 = new THREE.Mesh(new THREE.BoxGeometry(fw, fh, fd2), fm)
-          outer2.position.set(fw/2, fh/2, fd2/2); outer2.castShadow = outer2.receiveShadow = true; grp.add(outer2)
-          const innerM2 = new THREE.MeshStandardMaterial({ color: new THREE.Color(0.93,0.96,0.98), roughness: 0.07 })
-          const inner2 = new THREE.Mesh(new THREE.BoxGeometry(fw*0.8, fh*0.68, fd2*0.76), innerM2)
-          inner2.position.set(fw/2, fh*0.64, fd2/2); grp.add(inner2)
+          const ot=new THREE.Mesh(new THREE.BoxGeometry(fw,fh,fd),fm); ot.position.set(fw/2,fh/2,fd/2); ot.castShadow=ot.receiveShadow=true; grp.add(ot)
+          const iM=new THREE.MeshStandardMaterial({color:new THREE.Color(.93,.96,.98),roughness:.07})
+          const it=new THREE.Mesh(new THREE.BoxGeometry(fw*.8,fh*.68,fd*.76),iM); it.position.set(fw/2,fh*.64,fd/2); grp.add(it)
+
         } else if (f.type === 'vanity') {
-          const body4 = new THREE.Mesh(new THREE.BoxGeometry(fw, fh*0.58, fd2), fm)
-          body4.position.set(fw/2, fh*0.29, fd2/2); body4.castShadow = body4.receiveShadow = true; grp.add(body4)
-          const mirM = new THREE.MeshStandardMaterial({ color: new THREE.Color(0.72,0.78,0.84), roughness: 0.04, transparent: true, opacity: 0.65 })
-          const mir2 = new THREE.Mesh(new THREE.BoxGeometry(fw*0.9, fh*0.52, 0.04), mirM)
-          mir2.position.set(fw/2, fh*0.86, fd2*0.02); grp.add(mir2)
+          const bd=new THREE.Mesh(new THREE.BoxGeometry(fw,fh*.58,fd),fm); bd.position.set(fw/2,fh*.29,fd/2); bd.castShadow=bd.receiveShadow=true; grp.add(bd)
+          const mM=new THREE.MeshStandardMaterial({color:new THREE.Color(.72,.78,.84),roughness:.04,transparent:true,opacity:.65})
+          const mr=new THREE.Mesh(new THREE.BoxGeometry(fw*.9,fh*.52,.04),mM); mr.position.set(fw/2,fh*.86,fd*.02); grp.add(mr)
+
         } else if (f.type === 'toilet') {
-          const tank2 = new THREE.Mesh(new THREE.BoxGeometry(fw, fh*0.48, fd2*0.34), fm)
-          tank2.position.set(fw/2, fh*0.52, fd2*0.17); tank2.castShadow = true; grp.add(tank2)
-          const bowl2 = new THREE.Mesh(new THREE.BoxGeometry(fw*0.82, fh*0.3, fd2*0.68), fm)
-          bowl2.position.set(fw/2, fh*0.15, fd2*0.58); bowl2.castShadow = true; grp.add(bowl2)
+          const tk=new THREE.Mesh(new THREE.BoxGeometry(fw,fh*.48,fd*.34),fm); tk.position.set(fw/2,fh*.52,fd*.17); tk.castShadow=true; grp.add(tk)
+          const bw=new THREE.Mesh(new THREE.BoxGeometry(fw*.82,fh*.3,fd*.68),fm); bw.position.set(fw/2,fh*.15,fd*.58); bw.castShadow=true; grp.add(bw)
+
+        } else if (f.type === 'shower') {
+          const bs=new THREE.Mesh(new THREE.BoxGeometry(fw,.1,fd),fm); bs.position.set(fw/2,.05,fd/2); bs.receiveShadow=true; grp.add(bs)
+          const gM=new THREE.MeshStandardMaterial({color:new THREE.Color(.8,.9,.95),roughness:.05,transparent:true,opacity:.28})
+          const gF=new THREE.Mesh(new THREE.BoxGeometry(fw,fh,.06),gM); gF.position.set(fw/2,fh/2,0); grp.add(gF)
+          const gL=new THREE.Mesh(new THREE.BoxGeometry(.06,fh,fd),gM); gL.position.set(0,fh/2,fd/2); grp.add(gL)
+          const gR=new THREE.Mesh(new THREE.BoxGeometry(.06,fh,fd),gM); gR.position.set(fw,fh/2,fd/2); grp.add(gR)
+
         } else {
-          // Generic fallback box
-          const gen = new THREE.Mesh(new THREE.BoxGeometry(fw, fh, fd2), fm)
-          gen.position.set(fw/2, fh/2, fd2/2); gen.castShadow = gen.receiveShadow = true; grp.add(gen)
+          const gn=new THREE.Mesh(new THREE.BoxGeometry(fw,fh,fd),fm); gn.position.set(fw/2,fh/2,fd/2); gn.castShadow=gn.receiveShadow=true; grp.add(gn)
         }
 
         grp.position.set(x, 0, z)
-        grp.rotation.y = (f.rotation || 0) * Math.PI / 180
+        grp.rotation.y = (f.rotation||0) * Math.PI / 180
         scene.add(grp)
       })
 
       setReady(true)
 
-      // Render loop
-      function animate() {
-        rafRef.current = requestAnimationFrame(animate)
-        if (autoRef.current && !dragging.current) angleRef.current += 0.004
-        updateCam()
-        renderer.render(scene, camera)
-      }
-      rafRef.current = requestAnimationFrame(animate)
+      // Pointer handlers on canvas
+      function onDown(e: PointerEvent) { dragging.current=true; lastPos.current={x:e.clientX,y:e.clientY}; autoRef.current=false; setAuto(false); canvas.setPointerCapture(e.pointerId) }
+      function onMove(e: PointerEvent) { if(!dragging.current)return; angleRef.current+=(e.clientX-lastPos.current.x)*.008; vertRef.current=Math.max(.05,Math.min(.82,vertRef.current-(e.clientY-lastPos.current.y)*.006)); lastPos.current={x:e.clientX,y:e.clientY} }
+      function onUp() { dragging.current=false }
+      canvas.addEventListener('pointerdown',onDown); canvas.addEventListener('pointermove',onMove); canvas.addEventListener('pointerup',onUp); canvas.addEventListener('pointerleave',onUp)
 
+      // Responsive resize
+      const ro = new ResizeObserver(() => { const w=mount.offsetWidth||500; renderer.setSize(w,H_PX); camera.aspect=w/H_PX; camera.updateProjectionMatrix() })
+      ro.observe(mount)
+
+      // Render loop
+      function animate() { if(disposed)return; raf=requestAnimationFrame(animate); if(autoRef.current&&!dragging.current)angleRef.current+=.004; updateCam(); renderer.render(scene,camera) }
+      raf = requestAnimationFrame(animate)
+
+      // Cleanup fn returned from async IIFE
       return () => {
-        disposed = true
-        cancelAnimationFrame(rafRef.current)
-        renderer.dispose()
+        disposed=true; cancelAnimationFrame(raf)
+        canvas.removeEventListener('pointerdown',onDown); canvas.removeEventListener('pointermove',onMove); canvas.removeEventListener('pointerup',onUp); canvas.removeEventListener('pointerleave',onUp)
+        ro.disconnect(); renderer.dispose()
+        if(canvas.parentNode) canvas.parentNode.removeChild(canvas)
       }
     })()
 
-    return () => { disposed = true; cancelAnimationFrame(rafRef.current) }
+    return () => { disposed=true; cancelAnimationFrame(rafRef.current) }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [layoutJSON])
 
-  function onPD(e: React.PointerEvent) { dragging.current = true; lastPos.current = { x: e.clientX, y: e.clientY }; autoRef.current = false; setAuto(false) }
-  function onPM(e: React.PointerEvent) {
-    if (!dragging.current) return
-    angleRef.current += (e.clientX - lastPos.current.x) * 0.008
-    vertRef.current   = Math.max(0.05, Math.min(0.82, vertRef.current - (e.clientY - lastPos.current.y) * 0.006))
-    lastPos.current   = { x: e.clientX, y: e.clientY }
-  }
-  function onPU() { dragging.current = false }
-
   function saveImg() {
-    const c = canvasRef.current; if (!c) return
-    const a = document.createElement('a'); a.href = c.toDataURL('image/png', 0.92); a.download = '3d-room.png'; a.click()
+    const c = mountRef.current?.querySelector('canvas') as HTMLCanvasElement|null
+    if(!c)return; const a=document.createElement('a'); a.href=c.toDataURL('image/png',.92); a.download='3d-room.png'; a.click()
   }
 
   return (
-    <div style={{ position: 'relative', borderRadius: 16, overflow: 'hidden', background: '#0f172a' }}>
+    <div ref={mountRef} style={{ position:'relative', borderRadius:16, overflow:'hidden', background:'#0f172a', minHeight:360 }}>
       {!ready && (
-        <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', zIndex: 10, background: '#0f172a' }}>
-          <div style={{ width: 32, height: 32, border: '3px solid rgba(79,124,255,0.25)', borderTopColor: '#4f7cff', borderRadius: '50%', animation: 'spin 0.8s linear infinite', marginBottom: 12 }} />
-          <p style={{ fontSize: 12, color: '#475569', fontFamily: 'inherit' }}>Building 3D room…</p>
+        <div style={{ position:'absolute', inset:0, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', zIndex:10, background:'#0f172a' }}>
+          <div style={{ width:32, height:32, border:'3px solid rgba(79,124,255,.25)', borderTopColor:'#4f7cff', borderRadius:'50%', animation:'spin .8s linear infinite', marginBottom:12 }} />
+          <p style={{ fontSize:12, color:'#475569', fontFamily:'inherit' }}>Building 3D room…</p>
         </div>
       )}
-      <canvas ref={canvasRef} width={680} height={340}
-        style={{ width: '100%', height: 340, display: 'block', cursor: dragging.current ? 'grabbing' : 'grab' }}
-        onPointerDown={onPD} onPointerMove={onPM} onPointerUp={onPU} onPointerLeave={onPU} />
-      <div style={{ position: 'absolute', top: 10, left: 10, display: 'flex', gap: 6 }}>
-        <div style={{ background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(8px)', borderRadius: 8, padding: '4px 10px', fontSize: 11, fontWeight: 700, color: 'white', border: '1px solid rgba(255,255,255,0.12)' }}>✦ 3D Live</div>
-        <button onClick={() => { autoRef.current = !auto; setAuto(!auto) }} style={{ background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(8px)', borderRadius: 8, padding: '4px 10px', fontSize: 11, fontWeight: 700, color: auto ? '#4f7cff' : 'rgba(255,255,255,0.5)', border: `1px solid ${auto ? 'rgba(79,124,255,0.4)' : 'rgba(255,255,255,0.12)'}`, cursor: 'pointer' }}>{auto ? '⟳ Auto' : '▶ Play'}</button>
-      </div>
-      <div style={{ position: 'absolute', top: 10, right: 10, background: 'rgba(0,0,0,0.55)', backdropFilter: 'blur(8px)', borderRadius: 8, padding: '4px 10px', fontSize: 10, color: 'rgba(255,255,255,0.45)', border: '1px solid rgba(255,255,255,0.08)' }}>Drag to orbit</div>
-      <button onClick={saveImg} style={{ position: 'absolute', bottom: 10, right: 10, background: 'rgba(79,124,255,0.85)', borderRadius: 8, padding: '5px 12px', fontSize: 11, fontWeight: 700, color: 'white', border: 'none', cursor: 'pointer' }}>⬇ Save PNG</button>
+      {ready && (<>
+        <div style={{ position:'absolute', top:10, left:10, display:'flex', gap:6, zIndex:5 }}>
+          <div style={{ background:'rgba(0,0,0,.6)', backdropFilter:'blur(8px)', borderRadius:8, padding:'4px 10px', fontSize:11, fontWeight:700, color:'white', border:'1px solid rgba(255,255,255,.12)' }}>✦ 3D Live</div>
+          <button onClick={()=>{ autoRef.current=!auto; setAuto(a=>!a) }} style={{ background:'rgba(0,0,0,.6)', backdropFilter:'blur(8px)', borderRadius:8, padding:'4px 10px', fontSize:11, fontWeight:700, color:auto?'#4f7cff':'rgba(255,255,255,.5)', border:`1px solid ${auto?'rgba(79,124,255,.4)':'rgba(255,255,255,.12)'}`, cursor:'pointer', fontFamily:'inherit' }}>{auto?'⟳ Auto':'▶ Play'}</button>
+        </div>
+        <div style={{ position:'absolute', top:10, right:10, zIndex:5, background:'rgba(0,0,0,.55)', backdropFilter:'blur(8px)', borderRadius:8, padding:'4px 10px', fontSize:10, color:'rgba(255,255,255,.4)', border:'1px solid rgba(255,255,255,.08)' }}>Drag to orbit</div>
+        <button onClick={saveImg} style={{ position:'absolute', bottom:10, right:10, zIndex:5, background:'rgba(79,124,255,.85)', borderRadius:8, padding:'5px 12px', fontSize:11, fontWeight:700, color:'white', border:'none', cursor:'pointer', fontFamily:'inherit' }}>⬇ Save PNG</button>
+      </>)}
     </div>
   )
 }
+
 
 
 const STEPS = [
