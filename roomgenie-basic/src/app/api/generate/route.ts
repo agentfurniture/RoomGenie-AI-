@@ -507,33 +507,96 @@ function buildRenderPrompt(layout: RoomLayoutJSON): { prompt: string; negative: 
 
 // ─── STAGE 5: REPLICATE IMAGE GENERATION ─────────────────────────────────────
 
-async function generateImage(prompt: string, negative: string, w: number, h: number): Promise<string | null> {
+async function generateImage(prompt: string, negative: string, _w: number, _h: number): Promise<string | null> {
   const token = process.env.REPLICATE_API_TOKEN
   if (!token) { console.log('[Replicate] No token'); return null }
 
+  // Use adirik/interior-design — fine-tuned specifically for interior design renders
+  // Far better than SDXL at understanding room types, furniture, and architectural prompts
   try {
-    const resp = await fetch('https://api.replicate.com/v1/models/stability-ai/sdxl/predictions', {
+    const resp = await fetch('https://api.replicate.com/v1/models/adirik/interior-design/predictions', {
       method:  'POST',
-      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Prefer': 'wait=60' },
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type':  'application/json',
+        'Prefer':        'wait=60',
+      },
       body: JSON.stringify({
-        input: { prompt, negative_prompt: negative, width: w, height: h,
-          num_inference_steps: 40, guidance_scale: 9, refine: 'expert_ensemble_refiner',
-          high_noise_frac: 0.8, apply_watermark: false }
+        input: {
+          prompt,
+          negative_prompt: negative,
+          guidance_scale:       15,
+          num_inference_steps:  50,
+          strength:             0.85,
+        }
       })
     })
 
-    if (!resp.ok) { console.error('[Replicate] Error:', resp.status, await resp.text()); return null }
+    if (!resp.ok) {
+      console.error('[Replicate] interior-design error:', resp.status, await resp.text())
+      // Fall through to SDXL fallback below
+    } else {
+      const pred = await resp.json()
+      console.log('[Replicate] interior-design prediction:', pred.id, pred.status)
 
-    const pred = await resp.json()
-    if (pred.status === 'succeeded' && pred.output?.[0]) return pred.output[0]
-    if (!pred.id) return null
+      if (pred.status === 'succeeded' && pred.output?.[0]) return pred.output[0]
 
-    for (let i = 0; i < 25; i++) {
+      if (pred.id) {
+        for (let i = 0; i < 24; i++) {
+          await new Promise(r => setTimeout(r, 2500))
+          const poll   = await fetch(`https://api.replicate.com/v1/predictions/${pred.id}`, { headers: { 'Authorization': `Bearer ${token}` } })
+          const result = await poll.json()
+          if (result.status === 'succeeded' && result.output?.[0]) {
+            console.log('[Replicate] interior-design success ✓')
+            return result.output[0]
+          }
+          if (result.status === 'failed' || result.status === 'canceled') {
+            console.error('[Replicate] interior-design failed:', result.error)
+            break
+          }
+        }
+      }
+    }
+
+    // Fallback: try SDXL with the same prompt
+    console.log('[Replicate] Falling back to SDXL...')
+    const resp2 = await fetch('https://api.replicate.com/v1/models/stability-ai/sdxl/predictions', {
+      method:  'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type':  'application/json',
+        'Prefer':        'wait=60',
+      },
+      body: JSON.stringify({
+        input: {
+          prompt,
+          negative_prompt:     negative,
+          width:                1344,
+          height:               768,
+          num_inference_steps:  40,
+          guidance_scale:       9,
+          refine:               'expert_ensemble_refiner',
+          high_noise_frac:      0.8,
+          apply_watermark:      false,
+        }
+      })
+    })
+
+    if (!resp2.ok) { console.error('[Replicate] SDXL error:', resp2.status); return null }
+
+    const pred2 = await resp2.json()
+    if (pred2.status === 'succeeded' && pred2.output?.[0]) return pred2.output[0]
+    if (!pred2.id) return null
+
+    for (let i = 0; i < 20; i++) {
       await new Promise(r => setTimeout(r, 2500))
-      const poll   = await fetch(`https://api.replicate.com/v1/predictions/${pred.id}`, { headers: { 'Authorization': `Bearer ${token}` } })
+      const poll   = await fetch(`https://api.replicate.com/v1/predictions/${pred2.id}`, { headers: { 'Authorization': `Bearer ${token}` } })
       const result = await poll.json()
-      if (result.status === 'succeeded' && result.output?.[0]) return result.output[0]
-      if (result.status === 'failed' || result.status === 'canceled') { console.error('[Replicate] Failed:', result.error); return null }
+      if (result.status === 'succeeded' && result.output?.[0]) {
+        console.log('[Replicate] SDXL fallback success ✓')
+        return result.output[0]
+      }
+      if (result.status === 'failed' || result.status === 'canceled') { console.error('[SDXL] Failed:', result.error); return null }
     }
     return null
   } catch (e) { console.error('[Replicate] Exception:', e); return null }
@@ -671,31 +734,25 @@ export async function POST(req: Request) {
     const mustHave = ROOM_MUST_HAVE[roomType] || ''
 
     const photoPrompt = [
-      // State room type 3× at the start — most important signal for SDXL
-      `interior design photograph of a ${style} ${roomType}`,
-      `this is a ${roomType}, must show: ${mustHave}`,
-      `${style} style ${roomType} interior`,
+      // Room type stated first and most prominently
+      `${style} style ${roomType} interior design`,
+      `a beautiful ${roomType} with ${mustHave}`,
       // Dimensions
-      `room is ${layout.dimensions.widthFt}ft wide by ${layout.dimensions.lengthFt}ft long, ${layout.dimensions.sqft} sqft`,
-      layout.dimensions.heightFt >= 10 ? `soaring ${layout.dimensions.heightFt}ft ceiling` : `${layout.dimensions.heightFt}ft ceiling`,
-      // Furniture from layout
-      `furniture: ${furnitureLine}`,
-      // Materials and surfaces
-      `${layout.floor.material} floor in ${layout.floor.color}`,
-      `${layout.walls.color} walls`,
-      layout.walls.accentWall || '',
-      // Style
+      `${layout.dimensions.widthFt} by ${layout.dimensions.lengthFt} feet, ${layout.dimensions.sqft} sqft`,
+      layout.dimensions.heightFt >= 10 ? `${layout.dimensions.heightFt}ft high ceiling` : '',
+      // Key furniture from layout
+      `containing ${furnitureLine}`,
+      // Surfaces
+      `${layout.floor.material} flooring, ${layout.walls.color} walls`,
+      // Style keywords
       layout.styleDetails,
       `${layout.mood} atmosphere`,
-      `lighting: ${layout.lighting.natural}, ${layout.lighting.ambient}`,
-      answers.mood     ? `${answers.mood} mood`         : '',
-      answers.material ? `${answers.material} finishes`  : '',
-      custom           ? `additional: ${custom}`         : '',
+      answers.mood     ? `${answers.mood} mood`        : '',
+      answers.material ? `${answers.material} finishes` : '',
+      custom           ? custom                         : '',
       // Quality
-      'wide angle architectural photography from corner showing full room',
-      'Architectural Digest quality, 8K photorealistic render, perfect lighting, sharp focus throughout',
-      'no people, no text, no watermarks, no outdoor',
-    ].filter(Boolean).join('. ')
+      'interior design photography, wide angle, entire room visible, professional lighting, photorealistic, 8K',
+    ].filter(Boolean).join(', ')
 
     const photoNegative = [
       // Prevent wrong room type — specific per room
