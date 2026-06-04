@@ -1,1054 +1,667 @@
-'use client'
-import { useState, useCallback, useRef, useEffect } from 'react'
-import Link from 'next/link'
+/**
+ * RoomGenie AI — Generation Pipeline
+ * ====================================
+ * Architecture (6 stages):
+ *
+ * [1] VISION ANALYSIS      — Claude vision reads room photo + furniture photo
+ * [2] LAYOUT PLANNING      — Claude generates structured RoomLayoutJSON
+ * [3] FLOOR PLAN           — SVG generated deterministically from JSON (no AI needed)
+ * [4] PROMPT BUILDING      — Render prompt built from JSON data (not guessed)
+ * [5] IMAGE GENERATION     — Replicate SDXL renders from the precise prompt
+ * [6] RESPONSE             — Returns image, SVG floor plan, layout JSON, design metadata
+ *
+ * The key insight: both images derive from the SAME layout JSON,
+ * so they always match each other. Dimensions drive furniture placement.
+ * Furniture inventory is preserved. Room type cannot "drift".
+ */
 
-/* ─── TYPES ───────────────────────────────────────────────────────── */
-type LayoutJSON = {
-  dimensions: { widthFt: number; lengthFt: number; heightFt: number; sqft: number }
-  furniture:  Array<{ id: string; type: string; label: string; color: string; material: string; xFrac: number; yFrac: number; wFrac: number; dFrac: number; heightFt: number; rotation: number; preserved: boolean; notes: string }>
-  floor:   { material: string; color: string }
-  walls:   { color: string; material: string }
-  palette: { primary: string; secondary: string; accent: string; neutral: string }
+import { NextResponse } from 'next/server'
+
+// ─── TYPES ────────────────────────────────────────────────────────────────────
+
+interface RoomDimensions {
+  widthFt:  number
+  lengthFt: number
+  heightFt: number
+  sqft:     number
 }
 
-function hexToRgb(hex: string): [number, number, number] {
-  const h = (hex || '#888888').replace('#', '')
-  if (h.length !== 6) return [0.5, 0.5, 0.5]
-  return [parseInt(h.slice(0,2),16)/255, parseInt(h.slice(2,4),16)/255, parseInt(h.slice(4,6),16)/255]
+interface PlacedFurniture {
+  id:        string
+  type:      string
+  label:     string
+  color:     string
+  material:  string
+  xFrac:     number
+  yFrac:     number
+  wFrac:     number
+  dFrac:     number
+  heightFt:  number
+  rotation:  0 | 90 | 180 | 270
+  preserved: boolean
+  notes:     string
 }
 
-/* ─── 3D ROOM VIEWER ─────────────────────────────────────────────── */
-function RoomViewer3D({ layoutJSON, style, roomType }: { layoutJSON: LayoutJSON; style: string; roomType: string }) {
-  const mountRef  = useRef<HTMLDivElement>(null)
-  const rafRef    = useRef<number>(0)
-  const angleRef  = useRef(0.5)
-  const vertRef   = useRef(0.38)
-  const dragging  = useRef(false)
-  const lastPos   = useRef({ x: 0, y: 0 })
-  const autoRef   = useRef(true)
-  const [auto, setAuto]   = useState(true)
-  const [ready, setReady] = useState(false)
-
-  useEffect(() => {
-    const mount = mountRef.current
-    if (!mount) return
-    let disposed = false
-    let raf = 0
-
-    ;(async () => {
-      const THREE = await import('three')
-      if (disposed) return
-
-      const W_PX = mount.offsetWidth || 500
-      const H_PX = 360
-
-      // Create canvas programmatically — avoids SSR clientWidth=0 issue
-      const canvas = document.createElement('canvas')
-      canvas.style.cssText = `width:100%;height:${H_PX}px;display:block;cursor:grab;`
-      mount.appendChild(canvas)
-      if (disposed) { mount.removeChild(canvas); return }
-
-      const { widthFt: W, lengthFt: L, heightFt: H } = layoutJSON.dimensions
-      const cx = W / 2, cz = L / 2
-
-      const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' })
-      renderer.setSize(W_PX, H_PX)
-      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
-      renderer.shadowMap.enabled = true
-      renderer.shadowMap.type    = THREE.PCFSoftShadowMap
-      renderer.toneMapping       = THREE.ACESFilmicToneMapping
-      renderer.toneMappingExposure = 1.1
-
-      const scene  = new THREE.Scene()
-      scene.background = new THREE.Color(0xe8ecff)
-
-      const camera = new THREE.PerspectiveCamera(52, W_PX / H_PX, 0.1, 300)
-      const dist   = Math.max(W, L) * 1.2
-
-      function updateCam() {
-        const a = angleRef.current, v = vertRef.current
-        camera.position.set(
-          cx + dist * Math.sin(a) * Math.cos(v),
-          H  * 0.4  + dist * Math.sin(v),
-          cz + dist * Math.cos(a) * Math.cos(v)
-        )
-        camera.lookAt(cx, H * 0.25, cz)
-      }
-      updateCam()
-
-      // Lights
-      scene.add(new THREE.AmbientLight(0xffffff, 0.68))
-      const sun = new THREE.DirectionalLight(0xfff5e0, 1.85)
-      sun.position.set(W * 0.7, H * 2.2, L * 0.4)
-      sun.castShadow = true
-      sun.shadow.mapSize.set(2048, 2048)
-      sun.shadow.camera.left   = -W * 1.5
-      sun.shadow.camera.right  =  W * 1.5
-      sun.shadow.camera.top    =  L * 1.5
-      sun.shadow.camera.bottom = -L * 1.5
-      sun.shadow.bias = -0.001
-      scene.add(sun)
-      const fill = new THREE.DirectionalLight(0xffd0a0, 0.35)
-      fill.position.set(-W * 0.5, H * 0.4, -L * 0.6)
-      scene.add(fill)
-
-      // Helpers
-      function mkMat(color: string, roughness = 0.85, metalness = 0) {
-        return new THREE.MeshStandardMaterial({ color: new THREE.Color(...hexToRgb(color)), roughness, metalness })
-      }
-      function addBox(w: number, h: number, d: number, x: number, y: number, z: number, m: import('three').Material, sh = true) {
-        const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m)
-        mesh.position.set(x, y, z)
-        if (sh) { mesh.castShadow = true; mesh.receiveShadow = true }
-        scene.add(mesh); return mesh
-      }
-
-      // Room shell
-      const wallM  = mkMat(layoutJSON.walls.color  || '#F5F2ED', 0.92)
-      const floorM = mkMat(layoutJSON.floor.color  || '#C4A882', layoutJSON.floor.material === 'marble' ? 0.12 : 0.75, layoutJSON.floor.material === 'marble' ? 0.05 : 0)
-      const ceilM  = mkMat('#FAFAFA', 0.95)
-
-      const fl = new THREE.Mesh(new THREE.PlaneGeometry(W, L), floorM)
-      fl.rotation.x = -Math.PI / 2; fl.position.set(cx, 0, cz); fl.receiveShadow = true; scene.add(fl)
-      const cl = new THREE.Mesh(new THREE.PlaneGeometry(W, L), ceilM)
-      cl.rotation.x =  Math.PI / 2; cl.position.set(cx, H, cz); scene.add(cl)
-
-      addBox(W, H, 0.18, cx, H/2, 0, wallM)                       // back wall
-      addBox(0.18, H, L,  0,  H/2, cz, wallM)                     // left wall
-      addBox(0.18, H, L,  W,  H/2, cz, wallM)                     // right wall
-      // Front wall with gap so we can see inside
-      addBox(W * 0.22, H, 0.18, W * 0.11, H/2, L, wallM)
-      addBox(W * 0.22, H, 0.18, W * 0.89, H/2, L, wallM)
-      addBox(W * 0.56, H * 0.26, 0.18, cx, H * 0.87, L, wallM)
-      // Skirting
-      const skM = mkMat('#F8F8F8', 0.6)
-      addBox(W, 0.18, 0.07, cx, 0.09, 0.04, skM, false)
-      addBox(0.07, 0.18, L, 0.04, 0.09, cz, skM, false)
-      addBox(0.07, 0.18, L, W - 0.04, 0.09, cz, skM, false)
-      // Window
-      const glassM = new THREE.MeshStandardMaterial({ color: new THREE.Color(0.7, 0.88, 1), roughness: 0.05, transparent: true, opacity: 0.28 })
-      const win = new THREE.Mesh(new THREE.BoxGeometry(0.06, H * 0.52, L * 0.32), glassM)
-      win.position.set(W, H * 0.56, cz); scene.add(win)
-
-      // Furniture
-      layoutJSON.furniture.forEach(f => {
-        const fw = Math.max(f.wFrac * W, 0.1)
-        const fd = Math.max(f.dFrac * L, 0.1)
-        const fh = Math.max(f.heightFt, 0.12)
-        const x  = f.xFrac * W
-        const z  = f.yFrac * L
-        const [r, g, b] = hexToRgb(f.color || '#8B8680')
-        const hard = ['metal','glass','marble','ceramic'].includes((f.material||'').toLowerCase().split(/[\s,]/)[0])
-        const fm = new THREE.MeshStandardMaterial({ color: new THREE.Color(r,g,b), roughness: hard ? 0.2 : 0.82, metalness: hard ? 0.6 : 0 })
-        const grp = new THREE.Group()
-
-        if (f.type === 'rug') {
-          const rg = new THREE.Mesh(new THREE.BoxGeometry(fw,0.04,fd), fm); rg.position.set(fw/2,0.02,fd/2); rg.receiveShadow=true; grp.add(rg)
-
-        } else if (f.type === 'sofa' || f.type === 'chaise') {
-          const seat = new THREE.Mesh(new THREE.BoxGeometry(fw,fh*.44,fd*.7),fm); seat.position.set(fw/2,fh*.22,fd*.38); seat.castShadow=seat.receiveShadow=true; grp.add(seat)
-          const bk = new THREE.Mesh(new THREE.BoxGeometry(fw,fh*.62,fd*.22),fm); bk.position.set(fw/2,fh*.35,fd*.11); bk.castShadow=true; grp.add(bk)
-          ;[0.05,0.95].forEach(ax=>{ const arm=new THREE.Mesh(new THREE.BoxGeometry(fw*.09,fh*.5,fd*.7),fm); arm.position.set(fw*ax,fh*.28,fd*.38); arm.castShadow=true; grp.add(arm) })
-          const lm=new THREE.MeshStandardMaterial({color:new THREE.Color(.18,.12,.08),roughness:.5})
-          ;[[.1,.88],[.9,.88],[.1,.12],[.9,.12]].forEach(([lx,lz])=>{ const lg=new THREE.Mesh(new THREE.CylinderGeometry(.04,.04,fh*.11,6),lm); lg.position.set(fw*lx,fh*.055,fd*lz); grp.add(lg) })
-
-        } else if (f.type === 'bed' || f.type === 'murphy_bed') {
-          const bs=new THREE.Mesh(new THREE.BoxGeometry(fw,fh*.26,fd),fm); bs.position.set(fw/2,fh*.13,fd/2); bs.castShadow=bs.receiveShadow=true; grp.add(bs)
-          const mm=new THREE.MeshStandardMaterial({color:new THREE.Color(.97,.95,.92),roughness:.96})
-          const mt=new THREE.Mesh(new THREE.BoxGeometry(fw*.93,fh*.16,fd*.93),mm); mt.position.set(fw/2,fh*.35,fd/2); mt.castShadow=true; grp.add(mt)
-          const hb=new THREE.Mesh(new THREE.BoxGeometry(fw,fh*.65,fd*.12),fm); hb.position.set(fw/2,fh*.46,fd*.06); hb.castShadow=true; grp.add(hb)
-          const pm=new THREE.MeshStandardMaterial({color:new THREE.Color(.96,.96,.99),roughness:.96})
-          ;[.28,.72].forEach(px=>{ const p=new THREE.Mesh(new THREE.BoxGeometry(fw*.27,fh*.11,fd*.17),pm); p.position.set(fw*px,fh*.5,fd*.21); p.castShadow=true; grp.add(p) })
-          const dv=new THREE.Mesh(new THREE.BoxGeometry(fw*.91,fh*.07,fd*.61),new THREE.MeshStandardMaterial({color:new THREE.Color(.92,.89,.85),roughness:.98})); dv.position.set(fw/2,fh*.48,fd*.59); grp.add(dv)
-          const lm2=new THREE.MeshStandardMaterial({color:new THREE.Color(.22,.16,.1),roughness:.5})
-          ;[[.06,.94],[.94,.94],[.06,.06],[.94,.06]].forEach(([lx,lz])=>{ const lg=new THREE.Mesh(new THREE.CylinderGeometry(.045,.045,fh*.18,8),lm2); lg.position.set(fw*lx,fh*.09,fd*lz); grp.add(lg) })
-
-        } else if (['dining_table','coffee_table','island','desk'].includes(f.type)) {
-          const tp=new THREE.Mesh(new THREE.BoxGeometry(fw,fh*.07,fd),fm); tp.position.set(fw/2,fh,fd/2); tp.castShadow=tp.receiveShadow=true; grp.add(tp)
-          if(f.type==='desk'){
-            ;[.08,.92].forEach(lx=>{ const sp=new THREE.Mesh(new THREE.BoxGeometry(fw*.07,fh*.92,fd),fm); sp.position.set(fw*lx,fh*.46,fd/2); sp.castShadow=true; grp.add(sp) })
-          } else {
-            ;[[.08,.08],[.92,.08],[.08,.92],[.92,.92]].forEach(([lx,lz])=>{ const lg=new THREE.Mesh(new THREE.BoxGeometry(fw*.07,fh*.92,fw*.07),fm); lg.position.set(fw*lx,fh*.46,fd*lz); lg.castShadow=true; grp.add(lg) })
-          }
-
-        } else if (['chair','armchair','dining_chair','stool'].includes(f.type)) {
-          const st=new THREE.Mesh(new THREE.BoxGeometry(fw,fh*.4,fd*.82),fm); st.position.set(fw/2,fh*.42,fd*.52); st.castShadow=st.receiveShadow=true; grp.add(st)
-          if(f.type!=='stool'){ const bk=new THREE.Mesh(new THREE.BoxGeometry(fw,fh*.52,fd*.1),fm); bk.position.set(fw/2,fh*.68,fd*.05); bk.castShadow=true; grp.add(bk) }
-          ;[[.15,.1],[.85,.1],[.15,.9],[.85,.9]].forEach(([lx,lz])=>{ const lg=new THREE.Mesh(new THREE.CylinderGeometry(.03,.03,fh*.4,6),fm); lg.position.set(fw*lx,fh*.2,fd*lz); grp.add(lg) })
-
-        } else if (['bookshelf','shelving','wardrobe','sideboard','tv_unit','cabinets_lower'].includes(f.type)) {
-          const bd=new THREE.Mesh(new THREE.BoxGeometry(fw,fh,fd),fm); bd.position.set(fw/2,fh/2,fd/2); bd.castShadow=bd.receiveShadow=true; grp.add(bd)
-          const shM=new THREE.MeshStandardMaterial({color:new THREE.Color(Math.min(r*1.15,1),Math.min(g*1.15,1),Math.min(b*1.15,1)),roughness:.8})
-          const sc=Math.max(1,Math.floor(fh/1.2))
-          for(let s=1;s<sc;s++){ const sh=new THREE.Mesh(new THREE.BoxGeometry(fw*.94,.05,fd*.86),shM); sh.position.set(fw/2,(fh/sc)*s,fd/2); grp.add(sh) }
-          if(f.type==='tv_unit'){
-            const tvM=new THREE.MeshStandardMaterial({color:new THREE.Color(.04,.04,.07),roughness:.05,metalness:.85})
-            const tv=new THREE.Mesh(new THREE.BoxGeometry(fw*.85,fh*1.05,.07),tvM); tv.position.set(fw/2,fh*1.3,fd*.04); tv.castShadow=true; grp.add(tv)
-            const scM=new THREE.MeshStandardMaterial({color:new THREE.Color(.08,.12,.28),emissive:new THREE.Color(.04,.07,.15),emissiveIntensity:.7})
-            const sc2=new THREE.Mesh(new THREE.BoxGeometry(fw*.79,fh*.96,.02),scM); sc2.position.set(fw/2,fh*1.3,fd*.02); grp.add(sc2)
-          }
-
-        } else if (['nightstand','side_table','dresser'].includes(f.type)) {
-          const bd=new THREE.Mesh(new THREE.BoxGeometry(fw,fh*.84,fd),fm); bd.position.set(fw/2,fh*.42,fd/2); bd.castShadow=bd.receiveShadow=true; grp.add(bd)
-          const tM=new THREE.MeshStandardMaterial({color:new THREE.Color(Math.min(r*1.12,1),Math.min(g*1.12,1),Math.min(b*1.12,1)),roughness:.35})
-          const tp=new THREE.Mesh(new THREE.BoxGeometry(fw*1.02,fh*.07,fd*1.02),tM); tp.position.set(fw/2,fh*.875,fd/2); grp.add(tp)
-          const lpM=new THREE.MeshStandardMaterial({color:new THREE.Color(.22,.16,.1),roughness:.4,metalness:.3})
-          const lpB=new THREE.Mesh(new THREE.CylinderGeometry(fw*.1,fw*.13,fh*.06,10),lpM); lpB.position.set(fw*.68,fh*.94,fd*.48); grp.add(lpB)
-          const sdM=new THREE.MeshStandardMaterial({color:new THREE.Color(.96,.88,.7),roughness:.9,side:THREE.DoubleSide,emissive:new THREE.Color(.28,.18,.04),emissiveIntensity:.45})
-          const sd=new THREE.Mesh(new THREE.CylinderGeometry(fw*.2,fw*.26,fh*.26,12,1,true),sdM); sd.position.set(fw*.68,fh*1.14,fd*.48); grp.add(sd)
-
-        } else if (f.type === 'floor_lamp') {
-          const pM=new THREE.MeshStandardMaterial({color:new THREE.Color(.75,.65,.45),roughness:.3,metalness:.65})
-          const pl=new THREE.Mesh(new THREE.CylinderGeometry(.04,.04,fh*.87,8),pM); pl.position.set(fw/2,fh*.435,fd/2); pl.castShadow=true; grp.add(pl)
-          const lsM=new THREE.MeshStandardMaterial({color:new THREE.Color(.96,.89,.74),roughness:.9,side:THREE.DoubleSide,emissive:new THREE.Color(.26,.16,.03),emissiveIntensity:.5})
-          const ls=new THREE.Mesh(new THREE.CylinderGeometry(fw*.55,fw*.75,fh*.2,14,1,true),lsM); ls.position.set(fw/2,fh*.9,fd/2); grp.add(ls)
-          const bsM=new THREE.Mesh(new THREE.CylinderGeometry(fw*.35,fw*.4,.07,12),pM); bsM.position.set(fw/2,.035,fd/2); grp.add(bsM)
-
-        } else if (f.type === 'bathtub') {
-          const ot=new THREE.Mesh(new THREE.BoxGeometry(fw,fh,fd),fm); ot.position.set(fw/2,fh/2,fd/2); ot.castShadow=ot.receiveShadow=true; grp.add(ot)
-          const iM=new THREE.MeshStandardMaterial({color:new THREE.Color(.93,.96,.98),roughness:.07})
-          const it=new THREE.Mesh(new THREE.BoxGeometry(fw*.8,fh*.68,fd*.76),iM); it.position.set(fw/2,fh*.64,fd/2); grp.add(it)
-
-        } else if (f.type === 'vanity') {
-          const bd=new THREE.Mesh(new THREE.BoxGeometry(fw,fh*.58,fd),fm); bd.position.set(fw/2,fh*.29,fd/2); bd.castShadow=bd.receiveShadow=true; grp.add(bd)
-          const mM=new THREE.MeshStandardMaterial({color:new THREE.Color(.72,.78,.84),roughness:.04,transparent:true,opacity:.65})
-          const mr=new THREE.Mesh(new THREE.BoxGeometry(fw*.9,fh*.52,.04),mM); mr.position.set(fw/2,fh*.86,fd*.02); grp.add(mr)
-
-        } else if (f.type === 'toilet') {
-          const tk=new THREE.Mesh(new THREE.BoxGeometry(fw,fh*.48,fd*.34),fm); tk.position.set(fw/2,fh*.52,fd*.17); tk.castShadow=true; grp.add(tk)
-          const bw=new THREE.Mesh(new THREE.BoxGeometry(fw*.82,fh*.3,fd*.68),fm); bw.position.set(fw/2,fh*.15,fd*.58); bw.castShadow=true; grp.add(bw)
-
-        } else if (f.type === 'shower') {
-          const bs=new THREE.Mesh(new THREE.BoxGeometry(fw,.1,fd),fm); bs.position.set(fw/2,.05,fd/2); bs.receiveShadow=true; grp.add(bs)
-          const gM=new THREE.MeshStandardMaterial({color:new THREE.Color(.8,.9,.95),roughness:.05,transparent:true,opacity:.28})
-          const gF=new THREE.Mesh(new THREE.BoxGeometry(fw,fh,.06),gM); gF.position.set(fw/2,fh/2,0); grp.add(gF)
-          const gL=new THREE.Mesh(new THREE.BoxGeometry(.06,fh,fd),gM); gL.position.set(0,fh/2,fd/2); grp.add(gL)
-          const gR=new THREE.Mesh(new THREE.BoxGeometry(.06,fh,fd),gM); gR.position.set(fw,fh/2,fd/2); grp.add(gR)
-
-        } else {
-          const gn=new THREE.Mesh(new THREE.BoxGeometry(fw,fh,fd),fm); gn.position.set(fw/2,fh/2,fd/2); gn.castShadow=gn.receiveShadow=true; grp.add(gn)
-        }
-
-        grp.position.set(x, 0, z)
-        grp.rotation.y = (f.rotation||0) * Math.PI / 180
-        scene.add(grp)
-      })
-
-      setReady(true)
-
-      // Pointer handlers on canvas
-      function onDown(e: PointerEvent) { dragging.current=true; lastPos.current={x:e.clientX,y:e.clientY}; autoRef.current=false; setAuto(false); canvas.setPointerCapture(e.pointerId) }
-      function onMove(e: PointerEvent) { if(!dragging.current)return; angleRef.current+=(e.clientX-lastPos.current.x)*.008; vertRef.current=Math.max(.05,Math.min(.82,vertRef.current-(e.clientY-lastPos.current.y)*.006)); lastPos.current={x:e.clientX,y:e.clientY} }
-      function onUp() { dragging.current=false }
-      canvas.addEventListener('pointerdown',onDown); canvas.addEventListener('pointermove',onMove); canvas.addEventListener('pointerup',onUp); canvas.addEventListener('pointerleave',onUp)
-
-      // Responsive resize
-      const ro = new ResizeObserver(() => { const w=mount.offsetWidth||500; renderer.setSize(w,H_PX); camera.aspect=w/H_PX; camera.updateProjectionMatrix() })
-      ro.observe(mount)
-
-      // Render loop
-      function animate() { if(disposed)return; raf=requestAnimationFrame(animate); if(autoRef.current&&!dragging.current)angleRef.current+=.004; updateCam(); renderer.render(scene,camera) }
-      raf = requestAnimationFrame(animate)
-
-      // Cleanup fn returned from async IIFE
-      return () => {
-        disposed=true; cancelAnimationFrame(raf)
-        canvas.removeEventListener('pointerdown',onDown); canvas.removeEventListener('pointermove',onMove); canvas.removeEventListener('pointerup',onUp); canvas.removeEventListener('pointerleave',onUp)
-        ro.disconnect(); renderer.dispose()
-        if(canvas.parentNode) canvas.parentNode.removeChild(canvas)
-      }
-    })()
-
-    return () => { disposed=true; cancelAnimationFrame(rafRef.current) }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [layoutJSON])
-
-  function saveImg() {
-    const c = mountRef.current?.querySelector('canvas') as HTMLCanvasElement|null
-    if(!c)return; const a=document.createElement('a'); a.href=c.toDataURL('image/png',.92); a.download='3d-room.png'; a.click()
-  }
-
-  return (
-    <div ref={mountRef} style={{ position:'relative', borderRadius:16, overflow:'hidden', background:'#0f172a', minHeight:360 }}>
-      {!ready && (
-        <div style={{ position:'absolute', inset:0, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', zIndex:10, background:'#0f172a' }}>
-          <div style={{ width:32, height:32, border:'3px solid rgba(79,124,255,.25)', borderTopColor:'#4f7cff', borderRadius:'50%', animation:'spin .8s linear infinite', marginBottom:12 }} />
-          <p style={{ fontSize:12, color:'#475569', fontFamily:'inherit' }}>Building 3D room…</p>
-        </div>
-      )}
-      {ready && (<>
-        <div style={{ position:'absolute', top:10, left:10, display:'flex', gap:6, zIndex:5 }}>
-          <div style={{ background:'rgba(0,0,0,.6)', backdropFilter:'blur(8px)', borderRadius:8, padding:'4px 10px', fontSize:11, fontWeight:700, color:'white', border:'1px solid rgba(255,255,255,.12)' }}>✦ 3D Live</div>
-          <button onClick={()=>{ autoRef.current=!auto; setAuto(a=>!a) }} style={{ background:'rgba(0,0,0,.6)', backdropFilter:'blur(8px)', borderRadius:8, padding:'4px 10px', fontSize:11, fontWeight:700, color:auto?'#4f7cff':'rgba(255,255,255,.5)', border:`1px solid ${auto?'rgba(79,124,255,.4)':'rgba(255,255,255,.12)'}`, cursor:'pointer', fontFamily:'inherit' }}>{auto?'⟳ Auto':'▶ Play'}</button>
-        </div>
-        <div style={{ position:'absolute', top:10, right:10, zIndex:5, background:'rgba(0,0,0,.55)', backdropFilter:'blur(8px)', borderRadius:8, padding:'4px 10px', fontSize:10, color:'rgba(255,255,255,.4)', border:'1px solid rgba(255,255,255,.08)' }}>Drag to orbit</div>
-        <button onClick={saveImg} style={{ position:'absolute', bottom:10, right:10, zIndex:5, background:'rgba(79,124,255,.85)', borderRadius:8, padding:'5px 12px', fontSize:11, fontWeight:700, color:'white', border:'none', cursor:'pointer', fontFamily:'inherit' }}>⬇ Save PNG</button>
-      </>)}
-    </div>
-  )
+interface RoomLayoutJSON {
+  roomId:      string
+  roomType:    string
+  style:       string
+  dimensions:  RoomDimensions
+  floor:       { material: string; color: string; pattern?: string }
+  walls:       { color: string; material: string; accentWall?: string }
+  ceiling:     { color: string; heightFt: number; feature?: string }
+  furniture:   PlacedFurniture[]
+  lighting:    { ambient: string; accent: string; natural: string }
+  palette:     { primary: string; secondary: string; accent: string; neutral: string }
+  styleDetails: string
+  mood:         string
+  designRationale: string
+  spatialNotes:    string
+  // Claude-generated display fields
+  title?:       string
+  tagline?:     string
+  description?: string
+  colors?:      string[]
+  tips?:        string[]
+  materials?:   string[]
 }
 
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
 
+const STYLE_KEYWORDS: Record<string, string> = {
+  Modern:        'contemporary minimalist, clean straight lines, neutral white and grey, low-profile furniture, polished hardwood floors, recessed ceiling lights, metal accents',
+  Luxury:        'ultra luxury opulent, Italian marble floors, gold and brass fixtures, deep velvet upholstery, crystal chandelier, jewel tone walls, expensive art pieces',
+  Minimalist:    'extreme minimalism, pure white walls, single essential furniture only, polished floor, one pendant lamp, completely empty walls, zen atmosphere',
+  Scandinavian:  'nordic hygge, light pine wood floors, white walls, sheepskin throw, simple birch furniture, warm pendant lamp, indoor potted plants',
+  Industrial:    'urban loft, exposed red brick feature wall, polished concrete floor, black steel shelving, Edison filament bulbs, distressed leather, reclaimed wood',
+  Bohemian:      'boho eclectic, layered colorful Persian rugs, macrame wall hanging, many tropical plants, natural rattan furniture, warm amber lighting, patterned cushions',
+  Japandi:       'japandi fusion, very low wooden platform furniture, neutral beige cream tones, wabi-sabi ceramics, small bonsai, shoji screens, natural linen',
+  Classic:       'traditional classic european, ornate mahogany carved wood furniture, tufted velvet, crown moulding ceiling, antique brass chandelier, persian rug, silk drapes, dark hardwood floor',
+  Contemporary:  'contemporary chic, bold geometric accent wall, sleek mixed metal furniture, designer floor lamp, smoked glass table, oversized abstract art',
+  Mediterranean: 'mediterranean coastal, handmade terracotta tile floor, rough whitewashed plaster walls, arched doorway, cobalt blue ceramics, wrought iron lamp, large potted olive tree, golden sunlight',
+}
 
-const STEPS = [
-  { num: 1, label: 'Room' },
-  { num: 2, label: 'Style' },
-  { num: 3, label: 'Details' },
-  { num: 4, label: 'Generate' },
-]
+const DEFAULT_FURNITURE: Record<string, Omit<PlacedFurniture, 'id'>[]> = {
+  'Living Room': [
+    { type:'sofa',         label:'Main Sofa',        color:'#8B8680', material:'fabric', xFrac:0.15, yFrac:0.50, wFrac:0.40, dFrac:0.15, heightFt:3.0, rotation:0,   preserved:false, notes:'Centered on longest wall facing TV' },
+    { type:'coffee_table', label:'Coffee Table',      color:'#6B5B45', material:'wood',  xFrac:0.20, yFrac:0.38, wFrac:0.20, dFrac:0.10, heightFt:1.5, rotation:0,   preserved:false, notes:'In front of sofa' },
+    { type:'tv_unit',      label:'TV Unit',           color:'#4A4A4A', material:'wood',  xFrac:0.15, yFrac:0.08, wFrac:0.40, dFrac:0.08, heightFt:2.0, rotation:0,   preserved:false, notes:'Against short wall centered' },
+    { type:'armchair',     label:'Accent Chair',      color:'#7A6A5A', material:'fabric',xFrac:0.65, yFrac:0.45, wFrac:0.13, dFrac:0.12, heightFt:3.0, rotation:90,  preserved:false, notes:'Corner accent seating' },
+    { type:'rug',          label:'Area Rug',          color:'#C8B8A8', material:'wool',  xFrac:0.12, yFrac:0.35, wFrac:0.50, dFrac:0.35, heightFt:0.1, rotation:0,   preserved:false, notes:'Defines seating zone' },
+  ],
+  'Bedroom': [
+    { type:'bed',          label:'King Bed',          color:'#F5F0EB', material:'fabric',xFrac:0.20, yFrac:0.08, wFrac:0.55, dFrac:0.42, heightFt:4.5, rotation:0,   preserved:false, notes:'Centered headboard against far wall' },
+    { type:'nightstand',   label:'Left Nightstand',   color:'#8B7355', material:'wood',  xFrac:0.12, yFrac:0.12, wFrac:0.10, dFrac:0.12, heightFt:2.2, rotation:0,   preserved:false, notes:'Left of bed' },
+    { type:'nightstand',   label:'Right Nightstand',  color:'#8B7355', material:'wood',  xFrac:0.75, yFrac:0.12, wFrac:0.10, dFrac:0.12, heightFt:2.2, rotation:0,   preserved:false, notes:'Right of bed' },
+    { type:'wardrobe',     label:'Wardrobe',          color:'#D4C9BE', material:'wood',  xFrac:0.08, yFrac:0.70, wFrac:0.35, dFrac:0.18, heightFt:8.0, rotation:0,   preserved:false, notes:'Side wall full height' },
+    { type:'dresser',      label:'Dresser',           color:'#A09080', material:'wood',  xFrac:0.62, yFrac:0.72, wFrac:0.22, dFrac:0.14, heightFt:3.5, rotation:0,   preserved:false, notes:'Opposite to wardrobe' },
+    { type:'rug',          label:'Bedroom Rug',       color:'#E8DDD0', material:'wool',  xFrac:0.16, yFrac:0.38, wFrac:0.65, dFrac:0.35, heightFt:0.1, rotation:0,   preserved:false, notes:'Under foot of bed' },
+  ],
+  'Kitchen': [
+    { type:'cabinets_lower',label:'Lower Cabinets',   color:'#E8E0D4', material:'wood',  xFrac:0.05, yFrac:0.05, wFrac:0.55, dFrac:0.16, heightFt:3.0, rotation:0,   preserved:false, notes:'Main wall run' },
+    { type:'island',        label:'Kitchen Island',   color:'#C8B8A8', material:'stone', xFrac:0.25, yFrac:0.45, wFrac:0.35, dFrac:0.18, heightFt:3.2, rotation:0,   preserved:false, notes:'Central island' },
+    { type:'stool',         label:'Bar Stool 1',      color:'#6B5B45', material:'metal', xFrac:0.27, yFrac:0.63, wFrac:0.06, dFrac:0.06, heightFt:3.0, rotation:0,   preserved:false, notes:'Island seating' },
+    { type:'stool',         label:'Bar Stool 2',      color:'#6B5B45', material:'metal', xFrac:0.37, yFrac:0.63, wFrac:0.06, dFrac:0.06, heightFt:3.0, rotation:0,   preserved:false, notes:'Island seating' },
+    { type:'stool',         label:'Bar Stool 3',      color:'#6B5B45', material:'metal', xFrac:0.47, yFrac:0.63, wFrac:0.06, dFrac:0.06, heightFt:3.0, rotation:0,   preserved:false, notes:'Island seating' },
+  ],
+  'Home Office': [
+    { type:'desk',         label:'Executive Desk',    color:'#6B5B45', material:'wood',  xFrac:0.15, yFrac:0.10, wFrac:0.45, dFrac:0.20, heightFt:2.5, rotation:0,   preserved:false, notes:'Facing window' },
+    { type:'chair',        label:'Office Chair',      color:'#2C2C2C', material:'mesh',  xFrac:0.28, yFrac:0.30, wFrac:0.14, dFrac:0.14, heightFt:4.5, rotation:0,   preserved:false, notes:'Behind desk' },
+    { type:'bookshelf',    label:'Floor-Ceiling Bookcase',color:'#8B7355',material:'wood',xFrac:0.70,yFrac:0.05,wFrac:0.25,dFrac:0.15,heightFt:8.0, rotation:0,   preserved:false, notes:'Side wall full height' },
+  ],
+  'Dining Room': [
+    { type:'dining_table', label:'Dining Table',      color:'#6B5B45', material:'wood',  xFrac:0.18, yFrac:0.22, wFrac:0.58, dFrac:0.45, heightFt:2.5, rotation:0,   preserved:false, notes:'Centered under chandelier' },
+    { type:'dining_chair', label:'Chair 1',           color:'#8B7355', material:'fabric',xFrac:0.19, yFrac:0.15, wFrac:0.10, dFrac:0.12, heightFt:3.2, rotation:0,   preserved:false, notes:'Head' },
+    { type:'dining_chair', label:'Chair 2',           color:'#8B7355', material:'fabric',xFrac:0.33, yFrac:0.15, wFrac:0.10, dFrac:0.12, heightFt:3.2, rotation:0,   preserved:false, notes:'Side' },
+    { type:'dining_chair', label:'Chair 3',           color:'#8B7355', material:'fabric',xFrac:0.47, yFrac:0.15, wFrac:0.10, dFrac:0.12, heightFt:3.2, rotation:0,   preserved:false, notes:'Side' },
+    { type:'dining_chair', label:'Chair 4',           color:'#8B7355', material:'fabric',xFrac:0.61, yFrac:0.15, wFrac:0.10, dFrac:0.12, heightFt:3.2, rotation:0,   preserved:false, notes:'End' },
+    { type:'sideboard',    label:'Sideboard',         color:'#5B4B35', material:'wood',  xFrac:0.10, yFrac:0.78, wFrac:0.45, dFrac:0.14, heightFt:3.0, rotation:0,   preserved:false, notes:'Back wall' },
+  ],
+  'Bathroom': [
+    { type:'bathtub',      label:'Freestanding Tub',  color:'#F0EDE8', material:'acrylic',xFrac:0.52,yFrac:0.10,wFrac:0.38,dFrac:0.32,heightFt:2.5, rotation:0,   preserved:false, notes:'Feature near window' },
+    { type:'vanity',       label:'Double Vanity',     color:'#D4C9BE', material:'wood',  xFrac:0.05, yFrac:0.08, wFrac:0.42, dFrac:0.18, heightFt:3.2, rotation:0,   preserved:false, notes:'Main wall' },
+    { type:'shower',       label:'Walk-in Shower',    color:'#E8E8E8', material:'glass', xFrac:0.52, yFrac:0.55, wFrac:0.40, dFrac:0.40, heightFt:8.0, rotation:0,   preserved:false, notes:'Corner glass' },
+    { type:'toilet',       label:'Toilet',            color:'#F5F2EF', material:'ceramic',xFrac:0.10,yFrac:0.60,wFrac:0.14,dFrac:0.20,heightFt:2.8, rotation:0,   preserved:false, notes:'Private corner' },
+  ],
+  'Kids Room': [
+    { type:'bed',          label:'Single Bed',        color:'#FFE4E1', material:'wood',  xFrac:0.08, yFrac:0.08, wFrac:0.38, dFrac:0.30, heightFt:3.5, rotation:0,   preserved:false, notes:'Against wall leaving play space' },
+    { type:'desk',         label:'Study Desk',        color:'#FFF8DC', material:'wood',  xFrac:0.62, yFrac:0.08, wFrac:0.28, dFrac:0.18, heightFt:2.4, rotation:0,   preserved:false, notes:'Near window' },
+    { type:'shelving',     label:'Toy Shelves',       color:'#E8F4FD', material:'wood',  xFrac:0.08, yFrac:0.70, wFrac:0.50, dFrac:0.14, heightFt:5.0, rotation:0,   preserved:false, notes:'Low accessible storage' },
+    { type:'wardrobe',     label:'Wardrobe',          color:'#F0F8E8', material:'wood',  xFrac:0.70, yFrac:0.65, wFrac:0.24, dFrac:0.20, heightFt:7.5, rotation:0,   preserved:false, notes:'Full height' },
+    { type:'rug',          label:'Play Rug',          color:'#FFD700', material:'nylon', xFrac:0.10, yFrac:0.40, wFrac:0.55, dFrac:0.25, heightFt:0.1, rotation:0,   preserved:false, notes:'Central play area' },
+  ],
+  'Master Suite': [
+    { type:'bed',          label:'King Bed',          color:'#F0EBE3', material:'fabric',xFrac:0.22, yFrac:0.06, wFrac:0.52, dFrac:0.42, heightFt:4.8, rotation:0,   preserved:false, notes:'Centered feature headboard wall' },
+    { type:'nightstand',   label:'Left Nightstand',   color:'#8B7355', material:'marble',xFrac:0.13, yFrac:0.10, wFrac:0.09, dFrac:0.11, heightFt:2.2, rotation:0,   preserved:false, notes:'His side' },
+    { type:'nightstand',   label:'Right Nightstand',  color:'#8B7355', material:'marble',xFrac:0.74, yFrac:0.10, wFrac:0.09, dFrac:0.11, heightFt:2.2, rotation:0,   preserved:false, notes:'Her side' },
+    { type:'chaise',       label:'Chaise Lounge',     color:'#C8B8A8', material:'velvet',xFrac:0.68, yFrac:0.62, wFrac:0.25, dFrac:0.14, heightFt:3.0, rotation:90,  preserved:false, notes:'Reading nook corner' },
+    { type:'vanity',       label:'Dressing Vanity',   color:'#D4C9BE', material:'wood',  xFrac:0.08, yFrac:0.65, wFrac:0.22, dFrac:0.15, heightFt:5.5, rotation:0,   preserved:false, notes:'With Hollywood mirror' },
+    { type:'rug',          label:'Luxury Rug',        color:'#E0D5C5', material:'wool',  xFrac:0.15, yFrac:0.38, wFrac:0.68, dFrac:0.30, heightFt:0.1, rotation:0,   preserved:false, notes:'Defines sleeping zone' },
+  ],
+  'Studio': [
+    { type:'murphy_bed',   label:'Murphy Wall Bed',   color:'#D4C9BE', material:'wood',  xFrac:0.05, yFrac:0.05, wFrac:0.45, dFrac:0.18, heightFt:8.0, rotation:0,   preserved:false, notes:'Wall bed closed = bookshelf' },
+    { type:'sofa',         label:'Compact Sofa',      color:'#8B8680', material:'fabric',xFrac:0.55, yFrac:0.30, wFrac:0.35, dFrac:0.14, heightFt:3.0, rotation:90,  preserved:false, notes:'Living zone divider' },
+    { type:'dining_table', label:'Round Table',       color:'#6B5B45', material:'wood',  xFrac:0.18, yFrac:0.55, wFrac:0.20, dFrac:0.20, heightFt:2.5, rotation:0,   preserved:false, notes:'Dining zone' },
+  ],
+}
 
-const ROOM_TYPES = [
-  { name: 'Living Room',  icon: '🛋️' },
-  { name: 'Bedroom',      icon: '🛏️' },
-  { name: 'Kitchen',      icon: '🍳' },
-  { name: 'Bathroom',     icon: '🛁' },
-  { name: 'Home Office',  icon: '💻' },
-  { name: 'Dining Room',  icon: '🍽️' },
-  { name: 'Kids Room',    icon: '🧸' },
-  { name: 'Master Suite', icon: '✨' },
-  { name: 'Studio',       icon: '🏠' },
-]
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
 
-const STYLES = [
-  { name: 'Modern',        img: 'https://images.unsplash.com/photo-1583847268964-b28dc8f51f92?w=400&q=75&auto=format&fit=crop',  desc: 'Clean lines, neutral tones' },
-  { name: 'Luxury',        img: 'https://images.unsplash.com/photo-1616594039964-ae9021a400a0?w=400&q=75&auto=format&fit=crop',  desc: 'Opulent, premium finishes' },
-  { name: 'Minimalist',    img: 'https://images.unsplash.com/photo-1598928506311-c55ded91a20c?w=400&q=75&auto=format&fit=crop',  desc: 'Less is more' },
-  { name: 'Scandinavian',  img: 'https://images.unsplash.com/photo-1586023492125-27b2c045efd7?w=400&q=75&auto=format&fit=crop',  desc: 'Natural, cozy, functional' },
-  { name: 'Industrial',    img: 'https://images.unsplash.com/photo-1565183997392-2f6f122e5912?w=400&q=75&auto=format&fit=crop',  desc: 'Raw materials, exposed' },
-  { name: 'Bohemian',      img: 'https://images.unsplash.com/photo-1522444195799-478538b28823?w=400&q=75&auto=format&fit=crop',  desc: 'Eclectic, colorful, creative' },
-  { name: 'Japandi',       img: 'https://images.unsplash.com/photo-1526057565006-20beab8dd2ed?w=400&q=75&auto=format&fit=crop',  desc: 'Zen, harmonious, wabi-sabi' },
-  { name: 'Classic',       img: 'https://images.unsplash.com/photo-1615529162924-f8605388461d?w=400&q=75&auto=format&fit=crop',  desc: 'Timeless, traditional' },
-  { name: 'Contemporary',  img: 'https://images.unsplash.com/photo-1600585154340-be6161a56a0c?w=400&q=75&auto=format&fit=crop',  desc: 'Current, sophisticated' },
-  { name: 'Mediterranean', img: 'https://images.unsplash.com/photo-1558618666-fcd25c85cd64?w=400&q=75&auto=format&fit=crop',  desc: 'Warm, coastal vibes' },
-]
+function parseDims(formData: FormData): RoomDimensions {
+  const dimsRaw = formData.get('dimensions') as string
+  let raw = { width: '', length: '', height: '' }
+  try { if (dimsRaw) raw = { ...raw, ...JSON.parse(dimsRaw) } } catch { /**/ }
 
-const MOODS    = ['Cozy & Warm', 'Clean & Fresh', 'Bold & Dramatic', 'Calm & Zen', 'Playful & Fun', 'Sophisticated', 'Romantic', 'Energising']
-const BUDGETS  = ['Under $1K', '$1K–$5K', '$5K–$15K', '$15K–$50K', '$50K+']
-const LIGHTING = ['Very Bright', 'Moderate', 'Low Light', 'No Windows']
-const MATERIALS= ['Wood & Natural', 'Marble & Stone', 'Metal & Glass', 'Fabric & Soft', 'Mixed Materials']
+  const w = parseFloat(raw.width  || (formData.get('w') as string) || '0')
+  const l = parseFloat(raw.length || (formData.get('l') as string) || '0')
+  const h = parseFloat(raw.height || (formData.get('h') as string) || '9')
 
-type DesignResult = {
-  image: string
-  floorPlan: string | null
-  hasDimensions: boolean
-  dimensions: { w: string; l: string; h: string; sqft: number } | null
-  layoutJSON: LayoutJSON | null
-  design: {
-    title?: string; tagline?: string; description?: string; spatialNote?: string
-    colors?: string[]; furniture?: string[]; tips?: string[]; materials?: string[]
+  return {
+    widthFt:  w || 14,
+    lengthFt: l || 16,
+    heightFt: h || 9,
+    sqft:     Math.round((w || 14) * (l || 16)),
   }
 }
 
-/* ─── COMPONENT ───────────────────────────────────────────────────── */
-export default function CreatePage() {
-  const [step, setStep]           = useState(1)
-  const [roomType, setRoomType]   = useState('Living Room')
-  const [inputMode, setInputMode] = useState<'photo' | 'dimensions'>('photo')
-  const [roomFile, setRoomFile]   = useState<File | null>(null)
-  const [roomPreview, setRoomPrev]= useState<string | null>(null)
-  const [furnFile, setFurnFile]   = useState<File | null>(null)
-  const [furnPreview, setFurnPrev]= useState<string | null>(null)
-  const [dims, setDims]           = useState({ w: '', l: '', h: '' })
-  const [style, setStyle]         = useState('Modern')
-  const [mood, setMood]           = useState('')
-  const [budget, setBudget]       = useState('')
-  const [lighting, setLighting]   = useState('')
-  const [material, setMaterial]   = useState('')
-  const [prompt, setPrompt]       = useState('')
-  const [loading, setLoading]     = useState(false)
-  const [result, setResult]       = useState<DesignResult | null>(null)
-  const [error, setError]         = useState('')
-  const [copied, setCopied]       = useState(false)
-  const resultRef                 = useRef<HTMLDivElement>(null)
+function getDefaultLayout(
+  roomType: string, style: string, dims: RoomDimensions,
+  answers: Record<string, string>
+): RoomLayoutJSON {
+  const styleKw = STYLE_KEYWORDS[style] || style
+  const items   = (DEFAULT_FURNITURE[roomType] || DEFAULT_FURNITURE['Living Room'])
+    .map((f, i) => ({ ...f, id: `${f.type}_${i + 1}` }))
 
-  useEffect(() => {
-    if (result && resultRef.current) {
-      resultRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  return {
+    roomId:      `room_${Date.now()}`,
+    roomType, style,
+    dimensions:  dims,
+    floor:       { material: 'hardwood', color: '#C4A882', pattern: 'plank' },
+    walls:       { color: '#F5F2ED', material: 'painted plaster' },
+    ceiling:     { color: '#FFFFFF', heightFt: dims.heightFt },
+    furniture:   items,
+    lighting:    { ambient: 'warm recessed 2700K', accent: 'table lamps', natural: 'natural daylight windows' },
+    palette:     { primary: '#8B7355', secondary: '#F5F2ED', accent: '#4A90D9', neutral: '#E8E0D4' },
+    styleDetails: styleKw,
+    mood:        answers.mood || 'balanced and inviting',
+    designRationale: `${style} design optimised for ${dims.sqft} sqft.`,
+    spatialNotes:    `${dims.widthFt}×${dims.lengthFt}ft proportions allow comfortable furniture placement.`,
+  }
+}
+
+// ─── STAGE 1: VISION ANALYSIS ─────────────────────────────────────────────────
+
+async function analyzeImages(
+  anthropic: import('@anthropic-ai/sdk').default,
+  roomFile:  File | null,
+  furnFile:  File | null
+): Promise<{ roomContext: string; furnitureContext: string }> {
+  if (!roomFile && !furnFile) return { roomContext: '', furnitureContext: '' }
+
+  async function toBase64(f: File): Promise<{ data: string; type: 'image/jpeg' | 'image/png' | 'image/webp' }> {
+    const buf  = await f.arrayBuffer()
+    const arr  = new Uint8Array(buf)
+    let   bin  = ''
+    arr.forEach(b => bin += String.fromCharCode(b))
+    return {
+      data: btoa(bin),
+      type: (f.type || 'image/jpeg') as 'image/jpeg' | 'image/png' | 'image/webp'
     }
-  }, [result])
-
-  /* File handler */
-  const handleFile = useCallback((file: File, type: 'room' | 'furn') => {
-    const url = URL.createObjectURL(file)
-    if (type === 'room') { setRoomFile(file); setRoomPrev(url) }
-    else                  { setFurnFile(file); setFurnPrev(url) }
-  }, [])
-
-  /* Drop handler */
-  const onDrop = useCallback((e: React.DragEvent, type: 'room' | 'furn') => {
-    e.preventDefault()
-    const file = e.dataTransfer.files[0]
-    if (file) handleFile(file, type)
-  }, [handleFile])
-
-  /* Generate */
-  async function generate() {
-    setError(''); setLoading(true); setResult(null)
-    try {
-      const fd = new FormData()
-      if (roomFile) fd.append('image', roomFile)
-      fd.append('style', style)
-      fd.append('roomType', roomType)
-      const extras = [
-        mood     ? `Mood: ${mood}`         : '',
-        budget   ? `Budget: ${budget}`     : '',
-        lighting ? `Lighting: ${lighting}` : '',
-        material ? `Materials: ${material}`: '',
-        prompt   ? prompt                  : '',
-      ].filter(Boolean).join('. ')
-      fd.append('prompt', extras)
-      fd.append('answers', JSON.stringify({ mood, budget, lighting, material }))
-      fd.append('dimensions', JSON.stringify({ width: dims.w, length: dims.l, height: dims.h }))
-      if (furnFile) fd.append('furniture', JSON.stringify(['sofa']))
-
-      const res  = await fetch('/api/generate', { method: 'POST', body: fd })
-      const data = await res.json()
-      if (data.error) { setError(data.error); return }
-      setResult(data)
-    } catch { setError('Something went wrong. Please check your API configuration.') }
-    finally { setLoading(false) }
   }
 
-  /* ── STYLES ── */
-  const s = {
-    page:    { fontFamily: 'Inter,system-ui,sans-serif', background: '#f8faff', minHeight: '100vh' } as React.CSSProperties,
-    nav:     { position: 'fixed' as const, top: 0, left: 0, right: 0, zIndex: 1000, background: 'rgba(255,255,255,0.95)', backdropFilter: 'blur(20px)', borderBottom: '1px solid #e8eaf0' },
-    navIn:   { maxWidth: 1280, margin: '0 auto', padding: '0 28px', height: 64, display: 'flex', alignItems: 'center', justifyContent: 'space-between' },
-    logo:    { display: 'flex', alignItems: 'center', gap: 9, textDecoration: 'none' } as React.CSSProperties,
-    logoBox: { width: 34, height: 34, borderRadius: 10, background: 'linear-gradient(135deg,#4f7cff,#7c3aed)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white', fontWeight: 900, fontSize: 17 },
-    logoTxt: { fontWeight: 800, fontSize: 17, color: '#0f172a' },
-    gradTxt: { background: 'linear-gradient(135deg,#4f7cff,#7c3aed)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text' } as React.CSSProperties,
-    wrap:    { maxWidth: 900, margin: '0 auto', padding: '88px 24px 60px' },
-    card:    { background: 'white', border: '1px solid #e8eaf0', borderRadius: 20, padding: '32px 36px', marginBottom: 0 } as React.CSSProperties,
-    label:   { display: 'inline-block', background: '#eef2ff', border: '1px solid #c7d2fe', borderRadius: 100, padding: '4px 14px', fontSize: 11, fontWeight: 700, color: '#4f7cff', letterSpacing: '1px', textTransform: 'uppercase' as const },
-    h2:      { fontSize: 26, fontWeight: 900, letterSpacing: '-0.8px', color: '#0f172a', marginTop: 8, marginBottom: 4 },
-    sub:     { fontSize: 14, color: '#64748b', marginBottom: 28 },
-    chip:    (active: boolean): React.CSSProperties => ({
-      padding: '7px 16px', borderRadius: 20, fontSize: 13, fontWeight: 600, cursor: 'pointer',
-      border: `1.5px solid ${active ? '#4f7cff' : '#e2e8f0'}`,
-      background: active ? '#f0f4ff' : 'white',
-      color: active ? '#4f7cff' : '#64748b',
-      transition: 'all 0.15s',
-    }),
-    btnPrimary: {
-      display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 8,
-      background: 'linear-gradient(135deg,#4f7cff,#7c3aed)', color: 'white',
-      fontWeight: 700, fontSize: 15, padding: '12px 28px', borderRadius: 12,
-      border: 'none', cursor: 'pointer', fontFamily: 'inherit',
-      boxShadow: '0 6px 20px rgba(79,124,255,0.35)',
-      transition: 'transform 0.15s, box-shadow 0.15s',
-    } as React.CSSProperties,
-    btnSecondary: {
-      display: 'inline-flex', alignItems: 'center', gap: 8,
-      background: 'white', color: '#374151', fontWeight: 600, fontSize: 14,
-      padding: '11px 24px', borderRadius: 12, border: '1.5px solid #e2e8f0',
-      cursor: 'pointer', fontFamily: 'inherit', transition: 'all 0.15s',
-    } as React.CSSProperties,
+  const results = await Promise.all([
+    roomFile ? (async () => {
+      const { data, type } = await toBase64(roomFile)
+      const resp = await anthropic.messages.create({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 400,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: type, data } },
+            { type: 'text',  text: 'Describe this room briefly for interior design purposes: floor type, wall color, window placement, architectural features, existing furniture, estimated size. 3-4 sentences max.' }
+          ]
+        }]
+      })
+      return resp.content[0].type === 'text' ? resp.content[0].text : ''
+    })() : Promise.resolve(''),
+
+    furnFile ? (async () => {
+      const { data, type } = await toBase64(furnFile)
+      const resp = await anthropic.messages.create({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 300,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: type, data } },
+            { type: 'text',  text: 'List all furniture pieces visible with their approximate dimensions, colors, and materials. These must be preserved in the new design.' }
+          ]
+        }]
+      })
+      return resp.content[0].type === 'text' ? resp.content[0].text : ''
+    })() : Promise.resolve(''),
+  ])
+
+  return { roomContext: results[0], furnitureContext: results[1] }
+}
+
+// ─── STAGE 2: LAYOUT PLANNING ─────────────────────────────────────────────────
+
+async function planLayout(
+  anthropic:       import('@anthropic-ai/sdk').default,
+  style:           string,
+  roomType:        string,
+  dims:            RoomDimensions,
+  answers:         Record<string, string>,
+  custom:          string,
+  roomContext:     string,
+  furnitureContext: string
+): Promise<RoomLayoutJSON> {
+  const styleKw = STYLE_KEYWORDS[style] || style
+
+  const userContext = [
+    `Style: ${style}. Room: ${roomType}.`,
+    `Exact dimensions: ${dims.widthFt}ft wide × ${dims.lengthFt}ft long × ${dims.heightFt}ft ceiling. Total: ${dims.sqft} sqft.`,
+    answers.mood     ? `Mood: ${answers.mood}.`         : '',
+    answers.budget   ? `Budget: ${answers.budget}.`     : '',
+    answers.lighting ? `Lighting: ${answers.lighting}.` : '',
+    answers.material ? `Materials preference: ${answers.material}.` : '',
+    custom           ? `Client notes: ${custom}.`       : '',
+    roomContext      ? `Existing room: ${roomContext}`   : '',
+    furnitureContext  ? `Furniture to PRESERVE in new design: ${furnitureContext}` : '',
+  ].filter(Boolean).join('\n')
+
+  const resp = await anthropic.messages.create({
+    model:      'claude-haiku-4-5-20251001',
+    max_tokens: 2500,
+    system: `You are an expert interior designer and spatial planner.
+Generate PRECISE room layout JSON where ALL furniture positions and sizes are fractions of the room (0.0-1.0).
+- xFrac=0 is LEFT wall, xFrac=1 is RIGHT wall
+- yFrac=0 is FAR wall (back), yFrac=1 is NEAR wall (front/viewer)
+- wFrac = furniture width as fraction of room width
+- dFrac = furniture depth as fraction of room length
+- Ensure NO furniture overlaps. Maintain 3ft walkways (0.18 fraction at minimum).
+- Scale furniture REALISTICALLY: a sofa in a ${dims.sqft} sqft ${roomType} should be proportional.
+- If furniture to preserve is mentioned, include it with preserved:true.
+Respond ONLY with valid JSON. No markdown. No explanation.`,
+    messages: [{
+      role: 'user',
+      content: `${userContext}
+
+Generate complete room layout JSON:
+{
+  "roomId": "r${Date.now()}",
+  "roomType": "${roomType}",
+  "style": "${style}",
+  "dimensions": {"widthFt":${dims.widthFt},"lengthFt":${dims.lengthFt},"heightFt":${dims.heightFt},"sqft":${dims.sqft}},
+  "floor": {"material":"string","color":"#hex","pattern":"optional"},
+  "walls": {"color":"#hex","material":"string","accentWall":"optional"},
+  "ceiling": {"color":"#hex","heightFt":${dims.heightFt},"feature":"optional"},
+  "furniture": [{"id":"f1","type":"sofa|bed|etc","label":"Display Name","color":"#hex","material":"string","xFrac":0.0,"yFrac":0.0,"wFrac":0.0,"dFrac":0.0,"heightFt":0.0,"rotation":0,"preserved":false,"notes":"placement reason"}],
+  "lighting": {"ambient":"string","accent":"string","natural":"string"},
+  "palette": {"primary":"#hex","secondary":"#hex","accent":"#hex","neutral":"#hex"},
+  "styleDetails": "${styleKw}",
+  "mood": "${answers.mood || 'balanced'}",
+  "designRationale": "2 sentences on layout decisions",
+  "spatialNotes": "1 sentence on how dimensions shaped design",
+  "title": "Creative design title",
+  "tagline": "One poetic sentence",
+  "description": "3 sentences describing atmosphere and materials",
+  "colors": ["#hex - Name","#hex - Name","#hex - Name","#hex - Name"],
+  "tips": ["Specific design tip 1","Tip 2","Tip 3"],
+  "materials": ["Material 1","Material 2","Material 3"]
+}`
+    }]
+  })
+
+  const text = resp.content[0].type === 'text' ? resp.content[0].text : ''
+  try {
+    const layout = JSON.parse(text.replace(/```json?\n?/g, '').replace(/```\n?/g, '').trim()) as RoomLayoutJSON
+    // Ensure dimensions are always the user-provided values
+    layout.dimensions = dims
+    return layout
+  } catch (e) {
+    console.error('[Layout] Parse failed, using defaults:', e)
+    const fallback = getDefaultLayout(roomType, style, dims, answers)
+    fallback.title       = `${style} ${roomType}`
+    fallback.tagline     = 'A beautifully curated space.'
+    fallback.description = `A stunning ${style} ${roomType} designed for ${dims.sqft} sqft.`
+    fallback.colors      = ['#F5F5F0 - Warm White','#D4C5A9 - Sand','#8B7355 - Taupe','#2C2C2C - Charcoal']
+    fallback.tips        = ['Layer your lighting','Mix textures for depth','Maintain consistent palette']
+    fallback.materials   = ['Premium linen','Natural oak','Brushed brass']
+    return fallback
+  }
+}
+
+// ─── STAGE 3: SVG FLOOR PLAN ──────────────────────────────────────────────────
+
+function generateFloorPlanSVG(layout: RoomLayoutJSON): string {
+  const CW = 800, CH = 600, M = 56
+  const rpw = CW - M * 2
+  const rph = CH - M * 2
+  const ox  = M, oy = M
+
+  const scX = rpw / layout.dimensions.widthFt
+  const scY = rph / layout.dimensions.lengthFt
+
+  function lighten(hex: string, a = 0.6): string {
+    if (!hex || !hex.startsWith('#')) return '#f0ede8'
+    const r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16)
+    const lr = Math.round(r+(255-r)*a), lg = Math.round(g+(255-g)*a), lb = Math.round(b+(255-b)*a)
+    return `#${lr.toString(16).padStart(2,'0')}${lg.toString(16).padStart(2,'0')}${lb.toString(16).padStart(2,'0')}`
+  }
+  function darken(hex: string, a = 0.3): string {
+    if (!hex || !hex.startsWith('#')) return '#333333'
+    const r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16)
+    const dr = Math.round(r*(1-a)), dg = Math.round(g*(1-a)), db = Math.round(b*(1-a))
+    return `#${dr.toString(16).padStart(2,'0')}${dg.toString(16).padStart(2,'0')}${db.toString(16).padStart(2,'0')}`
   }
 
-  /* ── Progress bar ── */
-  const Progress = () => (
-    <div style={{ marginBottom: 36 }}>
-      {/* Step tabs */}
-      <div style={{ display: 'flex', gap: 0, borderBottom: '2px solid #f1f5f9', marginBottom: 0 }}>
-        {STEPS.map(st => {
-          const done    = step > st.num
-          const active  = step === st.num
-          return (
-            <button key={st.num} onClick={() => { if (st.num < step) setStep(st.num) }}
-              style={{
-                flex: 1, padding: '14px 8px', background: 'none', border: 'none', cursor: st.num < step ? 'pointer' : 'default',
-                borderBottom: active ? '3px solid #4f7cff' : done ? '3px solid #c7d2fe' : '3px solid transparent',
-                position: 'relative', bottom: -2, transition: 'all 0.2s',
-              }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
-                <div style={{
-                  width: 24, height: 24, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  fontSize: 11, fontWeight: 800, flexShrink: 0,
-                  background: active ? 'linear-gradient(135deg,#4f7cff,#7c3aed)' : done ? '#eef2ff' : '#f8faff',
-                  color: active ? 'white' : done ? '#4f7cff' : '#94a3b8',
-                  border: done ? '1.5px solid #c7d2fe' : 'none',
-                }}>
-                  {done ? '✓' : st.num}
-                </div>
-                <span style={{ fontSize: 13, fontWeight: active ? 700 : 500, color: active ? '#4f7cff' : done ? '#64748b' : '#94a3b8' }}>
-                  {st.label}
-                </span>
-              </div>
-            </button>
-          )
-        })}
-      </div>
-      {/* Progress fill */}
-      <div style={{ height: 2, background: '#f1f5f9', marginTop: 0 }}>
-        <div style={{ height: '100%', width: `${((step - 1) / (STEPS.length - 1)) * 100}%`, background: 'linear-gradient(90deg,#4f7cff,#7c3aed)', transition: 'width 0.4s ease', borderRadius: 2 }} />
-      </div>
-    </div>
-  )
+  function renderPiece(f: PlacedFurniture): string {
+    const px = ox + f.xFrac * rpw
+    const py = oy + f.yFrac * rph
+    const pw = f.wFrac * rpw
+    const pd = f.dFrac * rph
+    if (pw < 4 || pd < 4) return ''
+    const cx = px + pw/2, cy = py + pd/2
+    const fill = lighten(f.color, 0.55)
+    const stroke = darken(f.color, 0.25)
+    const fs = Math.max(7, Math.min(10, pw/8))
+    const lbl = f.label.length > 14 ? f.label.slice(0,13)+'…' : f.label
+    const rotT = f.rotation ? `transform="rotate(${f.rotation},${cx.toFixed(1)},${cy.toFixed(1)})"` : ''
 
-  /* ── Upload Zone ── */
-  const UploadZone = ({ type, preview, label, icon, hint }: { type: 'room' | 'furn'; preview: string | null; label: string; icon: string; hint: string }) => (
-    <div>
-      {preview ? (
-        <div style={{ position: 'relative', borderRadius: 14, overflow: 'hidden', border: '2px solid #4f7cff' }}>
-          <img src={preview} alt={label} style={{ width: '100%', height: 200, objectFit: 'cover', display: 'block' }} />
-          <div style={{ position: 'absolute', inset: 0, background: 'linear-gradient(to top,rgba(0,0,0,0.5),transparent 50%)' }} />
-          <button onClick={() => type === 'room' ? (setRoomFile(null), setRoomPrev(null)) : (setFurnFile(null), setFurnPrev(null))}
-            style={{ position: 'absolute', top: 10, right: 10, background: 'rgba(0,0,0,0.65)', border: '1px solid rgba(255,255,255,0.2)', color: 'white', borderRadius: 8, padding: '4px 12px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}>
-            ✕ Remove
-          </button>
-          <div style={{ position: 'absolute', bottom: 12, left: 14, fontSize: 13, fontWeight: 700, color: 'white' }}>{label}</div>
-        </div>
-      ) : (
-        <label style={{ display: 'block', cursor: 'pointer' }}>
-          <div onDragOver={e => e.preventDefault()} onDrop={e => onDrop(e, type)}
-            style={{ border: '2px dashed #d1d5db', background: '#fafbff', borderRadius: 14, padding: '32px 20px', textAlign: 'center', transition: 'all 0.2s' }}>
-            <div style={{ fontSize: 36, marginBottom: 10 }}>{icon}</div>
-            <p style={{ fontSize: 14, fontWeight: 700, color: '#374151', marginBottom: 4 }}>{label}</p>
-            <p style={{ fontSize: 12, color: '#94a3b8', marginBottom: 12 }}>{hint}</p>
-            <span style={{ display: 'inline-block', background: '#eef2ff', border: '1px solid #c7d2fe', borderRadius: 8, padding: '6px 16px', fontSize: 12, fontWeight: 700, color: '#4f7cff' }}>Browse Files</span>
-          </div>
-          <input type="file" accept="image/*" style={{ display: 'none' }} onChange={e => { const f = e.target.files?.[0]; if (f) handleFile(f, type) }} />
-        </label>
-      )}
-    </div>
-  )
+    if (f.type === 'rug') {
+      return `<rect x="${px.toFixed(1)}" y="${py.toFixed(1)}" width="${pw.toFixed(1)}" height="${pd.toFixed(1)}" fill="none" stroke="${f.color}" stroke-width="1" stroke-dasharray="4,3" rx="2" opacity="0.45"/>`
+    }
+    if (f.type === 'bathtub') {
+      const rx=pw/2,ry=pd/2
+      return `<ellipse cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" rx="${rx.toFixed(1)}" ry="${ry.toFixed(1)}" fill="${fill}" stroke="${stroke}" stroke-width="1.5"/>
+      <ellipse cx="${cx.toFixed(1)}" cy="${(cy+ry*0.15).toFixed(1)}" rx="${(rx*.7).toFixed(1)}" ry="${(ry*.58).toFixed(1)}" fill="none" stroke="${stroke}" stroke-width="0.7"/>`
+    }
+    if (f.type === 'toilet') {
+      const th=pd*.28
+      return `<rect x="${px.toFixed(1)}" y="${py.toFixed(1)}" width="${pw.toFixed(1)}" height="${th.toFixed(1)}" fill="${fill}" stroke="${stroke}" stroke-width="1.2" rx="2"/>
+      <ellipse cx="${cx.toFixed(1)}" cy="${(py+th+(pd-th)*.5).toFixed(1)}" rx="${(pw*.44).toFixed(1)}" ry="${((pd-th)*.47).toFixed(1)}" fill="${fill}" stroke="${stroke}" stroke-width="1.2"/>`
+    }
+    if (f.type === 'shower') {
+      return `<rect x="${px.toFixed(1)}" y="${py.toFixed(1)}" width="${pw.toFixed(1)}" height="${pd.toFixed(1)}" fill="${lighten(f.color,.8)}" stroke="#888" stroke-width="1.5" rx="2" stroke-dasharray="5,2"/>
+      <line x1="${px.toFixed(1)}" y1="${py.toFixed(1)}" x2="${(px+pw).toFixed(1)}" y2="${(py+pd).toFixed(1)}" stroke="#aaa" stroke-width="0.6"/>
+      <line x1="${(px+pw).toFixed(1)}" y1="${py.toFixed(1)}" x2="${px.toFixed(1)}" y2="${(py+pd).toFixed(1)}" stroke="#aaa" stroke-width="0.6"/>`
+    }
+    if (f.type === 'bed' || f.type === 'murphy_bed') {
+      const pr=Math.min(pw*.10,pd*.15,10), p1x=px+pw*.25, p2x=px+pw*.70, py2=py+pd*.13
+      return `<g ${rotT}><rect x="${px.toFixed(1)}" y="${py.toFixed(1)}" width="${pw.toFixed(1)}" height="${pd.toFixed(1)}" fill="${fill}" stroke="${stroke}" stroke-width="1.5" rx="3"/>
+      <rect x="${px.toFixed(1)}" y="${py.toFixed(1)}" width="${pw.toFixed(1)}" height="${(pd*.18).toFixed(1)}" fill="${darken(f.color,.08)}" stroke="none" rx="2"/>
+      <circle cx="${p1x.toFixed(1)}" cy="${py2.toFixed(1)}" r="${pr.toFixed(1)}" fill="${lighten(f.color,.3)}" stroke="${darken(f.color,.15)}" stroke-width="0.8"/>
+      <circle cx="${p2x.toFixed(1)}" cy="${py2.toFixed(1)}" r="${pr.toFixed(1)}" fill="${lighten(f.color,.3)}" stroke="${darken(f.color,.15)}" stroke-width="0.8"/>
+      ${pw>32&&pd>20?`<text x="${cx.toFixed(1)}" y="${cy.toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="${fs}" fill="${darken(f.color,.5)}" font-family="Arial" font-weight="500">${lbl}</text>`:''}
+      </g>`
+    }
+    if (f.type === 'sofa' || f.type === 'chaise') {
+      const bh=pd*.24
+      return `<g ${rotT}><rect x="${px.toFixed(1)}" y="${py.toFixed(1)}" width="${pw.toFixed(1)}" height="${pd.toFixed(1)}" fill="${fill}" stroke="${stroke}" stroke-width="1.5" rx="3"/>
+      <rect x="${px.toFixed(1)}" y="${py.toFixed(1)}" width="${pw.toFixed(1)}" height="${bh.toFixed(1)}" fill="${darken(f.color,.1)}" stroke="none" rx="2"/>
+      ${pw>30&&pd>16?`<text x="${cx.toFixed(1)}" y="${cy.toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="${fs}" fill="${darken(f.color,.5)}" font-family="Arial">${lbl}</text>`:''}
+      </g>`
+    }
 
-  /* ── Navigation buttons ── */
-  const NavButtons = ({ canNext = true, nextLabel = 'Continue →', onNext }: { canNext?: boolean; nextLabel?: string; onNext?: () => void }) => (
-    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 36, paddingTop: 28, borderTop: '1px solid #f1f5f9' }}>
-      <button onClick={() => step > 1 ? setStep(step - 1) : undefined}
-        style={{ ...s.btnSecondary, visibility: step === 1 ? 'hidden' : 'visible' }}>
-        ← Back
-      </button>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: '#94a3b8' }}>
-        Step {step} of {STEPS.length}
-      </div>
-      <button onClick={onNext || (() => setStep(step + 1))} disabled={!canNext}
-        style={{ ...s.btnPrimary, opacity: canNext ? 1 : 0.45, cursor: canNext ? 'pointer' : 'not-allowed' }}>
-        {nextLabel}
-      </button>
-    </div>
-  )
-
-  /* ═══════════════════════════════════════════════════════════════
-     STEP 1 — ROOM
-  ═══════════════════════════════════════════════════════════════ */
-  const Step1 = () => (
-    <div>
-      <div style={s.label}>Step 1 of 4</div>
-      <h2 style={s.h2}>Your Room</h2>
-      <p style={s.sub}>Select room type and provide a photo or dimensions</p>
-
-      {/* Room type */}
-      <p style={{ fontSize: 13, fontWeight: 700, color: '#374151', marginBottom: 12 }}>Room Type</p>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 10, marginBottom: 32 }}>
-        {ROOM_TYPES.map(r => (
-          <button key={r.name} onClick={() => setRoomType(r.name)}
-            style={{ padding: '13px 12px', borderRadius: 12, border: `1.5px solid ${roomType === r.name ? '#4f7cff' : '#e2e8f0'}`, background: roomType === r.name ? '#f0f4ff' : 'white', cursor: 'pointer', transition: 'all 0.15s', display: 'flex', alignItems: 'center', gap: 8, fontFamily: 'inherit' }}>
-            <span style={{ fontSize: 20 }}>{r.icon}</span>
-            <span style={{ fontSize: 13, fontWeight: roomType === r.name ? 700 : 500, color: roomType === r.name ? '#4f7cff' : '#374151' }}>{r.name}</span>
-            {roomType === r.name && <span style={{ marginLeft: 'auto', color: '#4f7cff', fontWeight: 800, fontSize: 14 }}>✓</span>}
-          </button>
-        ))}
-      </div>
-
-      {/* Photo / Dimensions toggle */}
-      <div style={{ display: 'flex', gap: 0, background: '#f1f5f9', borderRadius: 12, padding: 4, marginBottom: 24, width: 'fit-content' }}>
-        {(['photo', 'dimensions'] as const).map(m => (
-          <button key={m} onClick={() => setInputMode(m)}
-            style={{ padding: '9px 20px', borderRadius: 9, fontSize: 13, fontWeight: 700, border: 'none', cursor: 'pointer', background: inputMode === m ? 'white' : 'transparent', color: inputMode === m ? '#4f7cff' : '#64748b', boxShadow: inputMode === m ? '0 2px 8px rgba(0,0,0,0.08)' : 'none', transition: 'all 0.2s', fontFamily: 'inherit' }}>
-            {m === 'photo' ? '📸 Room Photo' : '📐 Dimensions'}
-          </button>
-        ))}
-      </div>
-
-      {inputMode === 'photo' ? (
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-          <UploadZone type="room" preview={roomPreview} label="Room Photo" icon="🏠" hint="Upload your existing room — any angle works" />
-          <UploadZone type="furn" preview={furnPreview} label="Furniture Reference" icon="🛋️" hint="Optional — AI will incorporate your pieces" />
-        </div>
-      ) : (
-        <div>
-          <p style={{ fontSize: 13, color: '#64748b', marginBottom: 16 }}>Enter your room dimensions and AI will scale the design accordingly.</p>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 14 }}>
-            {[['w', 'Width (ft)', '14'], ['l', 'Length (ft)', '20'], ['h', 'Ceiling Height (ft)', '9']].map(([k, label, ph]) => (
-              <div key={k}>
-                <label style={{ fontSize: 12, fontWeight: 700, color: '#64748b', display: 'block', marginBottom: 6, textTransform: 'uppercase' as const, letterSpacing: '0.5px' }}>{label}</label>
-                <input type="number" placeholder={ph} value={dims[k as 'w' | 'l' | 'h']}
-                  onChange={e => setDims(d => ({ ...d, [k]: e.target.value }))}
-                  style={{ width: '100%', border: '1.5px solid #e2e8f0', borderRadius: 10, padding: '11px 14px', fontSize: 14, color: '#0f172a', outline: 'none', fontFamily: 'inherit', background: '#fafbff', transition: 'border-color 0.2s' }}
-                  onFocus={e => e.currentTarget.style.borderColor = '#4f7cff'}
-                  onBlur={e => e.currentTarget.style.borderColor = '#e2e8f0'} />
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      <NavButtons nextLabel="Choose Style →" />
-    </div>
-  )
-
-  /* ═══════════════════════════════════════════════════════════════
-     STEP 2 — STYLE
-  ═══════════════════════════════════════════════════════════════ */
-  const Step2 = () => (
-    <div>
-      <div style={s.label}>Step 2 of 4</div>
-      <h2 style={s.h2}>Design Style</h2>
-      <p style={s.sub}>Choose the aesthetic that speaks to you</p>
-
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5,1fr)', gap: 12 }}>
-        {STYLES.map(st => (
-          <button key={st.name} onClick={() => setStyle(st.name)}
-            style={{ position: 'relative', borderRadius: 14, overflow: 'hidden', border: `2.5px solid ${style === st.name ? '#4f7cff' : '#e8eaf0'}`, padding: 0, cursor: 'pointer', background: 'none', transition: 'all 0.2s', transform: style === st.name ? 'scale(1.04)' : 'scale(1)', boxShadow: style === st.name ? '0 0 0 4px rgba(79,124,255,0.12), 0 8px 20px rgba(0,0,0,0.1)' : '0 2px 6px rgba(0,0,0,0.05)' }}>
-            <img src={st.img} alt={st.name} style={{ width: '100%', height: 88, objectFit: 'cover', display: 'block' }} />
-            <div style={{ position: 'absolute', inset: 0, background: style === st.name ? 'rgba(79,124,255,0.18)' : 'linear-gradient(to top,rgba(0,0,0,0.55),transparent 55%)' }} />
-            {style === st.name && <div style={{ position: 'absolute', top: 6, right: 6, width: 20, height: 20, borderRadius: '50%', background: '#4f7cff', color: 'white', fontSize: 10, fontWeight: 900, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>✓</div>}
-            <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, padding: '8px 6px 9px', textAlign: 'center' }}>
-              <p style={{ fontSize: 11, fontWeight: 800, color: 'white', margin: 0, textShadow: '0 1px 3px rgba(0,0,0,0.6)' }}>{st.name}</p>
-              <p style={{ fontSize: 10, color: 'rgba(255,255,255,0.7)', margin: 0 }}>{st.desc}</p>
-            </div>
-          </button>
-        ))}
-      </div>
-
-      {/* Selected style info */}
-      {style && (
-        <div style={{ marginTop: 24, padding: '16px 20px', background: '#f0f4ff', borderRadius: 14, border: '1px solid #c7d2fe', display: 'flex', alignItems: 'center', gap: 16 }}>
-          <img src={STYLES.find(s => s.name === style)?.img} alt={style} style={{ width: 64, height: 48, objectFit: 'cover', borderRadius: 8, flexShrink: 0 }} />
-          <div>
-            <p style={{ fontSize: 14, fontWeight: 800, color: '#4f7cff', margin: 0 }}>{style} Selected</p>
-            <p style={{ fontSize: 13, color: '#64748b', margin: 0 }}>{STYLES.find(s => s.name === style)?.desc}</p>
-          </div>
-          <div style={{ marginLeft: 'auto', fontSize: 20, color: '#4f7cff' }}>✦</div>
-        </div>
-      )}
-
-      <NavButtons nextLabel="Add Details →" />
-    </div>
-  )
-
-  /* ═══════════════════════════════════════════════════════════════
-     STEP 3 — DETAILS
-  ═══════════════════════════════════════════════════════════════ */
-  const Step3 = () => (
-    <div>
-      <div style={s.label}>Step 3 of 4</div>
-      <h2 style={s.h2}>Design Preferences</h2>
-      <p style={s.sub}>Help Claude AI personalise your design — all fields are optional</p>
-
-      {/* Mood */}
-      <div style={{ marginBottom: 28 }}>
-        <p style={{ fontSize: 13, fontWeight: 700, color: '#374151', marginBottom: 12 }}>Desired Mood</p>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-          {MOODS.map(m => (
-            <button key={m} onClick={() => setMood(mood === m ? '' : m)} style={s.chip(mood === m)}>{m}</button>
-          ))}
-        </div>
-      </div>
-
-      {/* Budget */}
-      <div style={{ marginBottom: 28 }}>
-        <p style={{ fontSize: 13, fontWeight: 700, color: '#374151', marginBottom: 12 }}>Budget Range</p>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-          {BUDGETS.map(b => (
-            <button key={b} onClick={() => setBudget(budget === b ? '' : b)} style={s.chip(budget === b)}>{b}</button>
-          ))}
-        </div>
-      </div>
-
-      {/* 2-col row */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24, marginBottom: 28 }}>
-        <div>
-          <p style={{ fontSize: 13, fontWeight: 700, color: '#374151', marginBottom: 12 }}>Natural Lighting</p>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {LIGHTING.map(l => (
-              <button key={l} onClick={() => setLighting(lighting === l ? '' : l)}
-                style={{ padding: '10px 14px', borderRadius: 10, border: `1.5px solid ${lighting === l ? '#4f7cff' : '#e2e8f0'}`, background: lighting === l ? '#f0f4ff' : 'white', cursor: 'pointer', fontSize: 13, fontWeight: lighting === l ? 700 : 500, color: lighting === l ? '#4f7cff' : '#64748b', textAlign: 'left', display: 'flex', alignItems: 'center', gap: 8, fontFamily: 'inherit', transition: 'all 0.15s' }}>
-                {lighting === l ? <span style={{ color: '#4f7cff', fontWeight: 800 }}>●</span> : <span style={{ color: '#e2e8f0', fontWeight: 800 }}>○</span>}
-                {l}
-              </button>
-            ))}
-          </div>
-        </div>
-        <div>
-          <p style={{ fontSize: 13, fontWeight: 700, color: '#374151', marginBottom: 12 }}>Preferred Materials</p>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {MATERIALS.map(m => (
-              <button key={m} onClick={() => setMaterial(material === m ? '' : m)}
-                style={{ padding: '10px 14px', borderRadius: 10, border: `1.5px solid ${material === m ? '#4f7cff' : '#e2e8f0'}`, background: material === m ? '#f0f4ff' : 'white', cursor: 'pointer', fontSize: 13, fontWeight: material === m ? 700 : 500, color: material === m ? '#4f7cff' : '#64748b', textAlign: 'left', display: 'flex', alignItems: 'center', gap: 8, fontFamily: 'inherit', transition: 'all 0.15s' }}>
-                {material === m ? <span style={{ color: '#4f7cff', fontWeight: 800 }}>●</span> : <span style={{ color: '#e2e8f0', fontWeight: 800 }}>○</span>}
-                {m}
-              </button>
-            ))}
-          </div>
-        </div>
-      </div>
-
-      {/* Extra prompt */}
-      <div>
-        <p style={{ fontSize: 13, fontWeight: 700, color: '#374151', marginBottom: 8 }}>Anything else? <span style={{ fontWeight: 400, color: '#94a3b8' }}>(optional)</span></p>
-        <textarea value={prompt} onChange={e => setPrompt(e.target.value)}
-          placeholder="e.g. Built-in bookshelves, a cozy reading nook by the window, hidden cable management, room for two young kids..."
-          style={{ width: '100%', border: '1.5px solid #e2e8f0', borderRadius: 12, padding: '13px 16px', fontSize: 14, color: '#0f172a', outline: 'none', fontFamily: 'inherit', minHeight: 100, resize: 'none', background: '#fafbff', transition: 'border-color 0.2s, box-shadow 0.2s', lineHeight: 1.7 }}
-          onFocus={e => { e.currentTarget.style.borderColor = '#4f7cff'; e.currentTarget.style.boxShadow = '0 0 0 3px rgba(79,124,255,0.1)' }}
-          onBlur={e => { e.currentTarget.style.borderColor = '#e2e8f0'; e.currentTarget.style.boxShadow = 'none' }} />
-      </div>
-
-      <NavButtons nextLabel="Review & Generate →" />
-    </div>
-  )
-
-  /* ═══════════════════════════════════════════════════════════════
-     STEP 4 — GENERATE
-  ═══════════════════════════════════════════════════════════════ */
-  const Step4 = () => {
-    const summaryRows = [
-      { l: 'Room Type',    v: roomType },
-      { l: 'Input',        v: inputMode === 'photo' ? (roomFile ? `📸 ${roomFile.name}` : 'No photo (AI will create)') : dims.w ? `📐 ${dims.w}×${dims.l} ft, ${dims.h}ft ceiling` : 'No dimensions' },
-      { l: 'Style',        v: style },
-      { l: 'Mood',         v: mood         || '—' },
-      { l: 'Budget',       v: budget       || '—' },
-      { l: 'Lighting',     v: lighting     || '—' },
-      { l: 'Materials',    v: material     || '—' },
-      { l: 'Furniture',    v: furnFile ? `🛋️ ${furnFile.name}` : '—' },
-    ]
-
-    return (
-      <div>
-        <div style={s.label}>Step 4 of 4</div>
-        <h2 style={s.h2}>Review & Generate</h2>
-        <p style={s.sub}>Confirm your design brief — then let Claude AI and DALL·E 3 work their magic</p>
-
-        {/* Design brief summary */}
-        <div style={{ background: '#f8faff', border: '1px solid #e0e7ff', borderRadius: 16, overflow: 'hidden', marginBottom: 24 }}>
-          <div style={{ padding: '14px 20px', background: 'linear-gradient(135deg,#4f7cff,#7c3aed)', display: 'flex', alignItems: 'center', gap: 10 }}>
-            <div style={{ width: 30, height: 30, borderRadius: 9, background: 'rgba(255,255,255,0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 16 }}>📋</div>
-            <div>
-              <p style={{ fontSize: 13, fontWeight: 800, color: 'white', margin: 0 }}>Your Design Brief</p>
-              <p style={{ fontSize: 12, color: 'rgba(255,255,255,0.7)', margin: 0 }}>This is what Claude AI will use to generate your design</p>
-            </div>
-          </div>
-          <div style={{ padding: '4px 0' }}>
-            {summaryRows.map(({ l, v }) => (
-              <div key={l} style={{ display: 'flex', alignItems: 'flex-start', padding: '12px 20px', borderBottom: '1px solid #f1f5f9', gap: 16 }}>
-                <span style={{ fontSize: 12, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.5px', width: 90, flexShrink: 0, paddingTop: 1 }}>{l}</span>
-                <span style={{ fontSize: 13, fontWeight: 600, color: v === '—' ? '#d1d5db' : '#0f172a', lineHeight: 1.5 }}>{v}</span>
-              </div>
-            ))}
-            {prompt && (
-              <div style={{ padding: '12px 20px' }}>
-                <span style={{ fontSize: 12, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.5px', display: 'block', marginBottom: 6 }}>Custom Notes</span>
-                <p style={{ fontSize: 13, color: '#374151', lineHeight: 1.6, margin: 0, fontStyle: 'italic' }}>"{prompt}"</p>
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* Style preview */}
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 24 }}>
-          <div style={{ borderRadius: 14, overflow: 'hidden', position: 'relative', boxShadow: '0 4px 16px rgba(0,0,0,0.08)' }}>
-            <img src={STYLES.find(s => s.name === style)?.img} alt={style} style={{ width: '100%', height: 140, objectFit: 'cover', display: 'block' }} />
-            <div style={{ position: 'absolute', inset: 0, background: 'linear-gradient(to top,rgba(0,0,0,0.6),transparent 50%)' }} />
-            <div style={{ position: 'absolute', bottom: 12, left: 14 }}>
-              <p style={{ fontSize: 11, color: 'rgba(255,255,255,0.65)', margin: 0, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Style</p>
-              <p style={{ fontSize: 15, fontWeight: 800, color: 'white', margin: 0 }}>{style}</p>
-            </div>
-          </div>
-          {roomPreview ? (
-            <div style={{ borderRadius: 14, overflow: 'hidden', position: 'relative', boxShadow: '0 4px 16px rgba(0,0,0,0.08)' }}>
-              <img src={roomPreview} alt="Your room" style={{ width: '100%', height: 140, objectFit: 'cover', display: 'block' }} />
-              <div style={{ position: 'absolute', inset: 0, background: 'linear-gradient(to top,rgba(0,0,0,0.6),transparent 50%)' }} />
-              <div style={{ position: 'absolute', bottom: 12, left: 14 }}>
-                <p style={{ fontSize: 11, color: 'rgba(255,255,255,0.65)', margin: 0, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Your Room</p>
-                <p style={{ fontSize: 13, fontWeight: 700, color: 'white', margin: 0 }}>Photo Uploaded</p>
-              </div>
-            </div>
-          ) : (
-            <div style={{ borderRadius: 14, border: '2px dashed #c7d2fe', background: '#f0f4ff', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: 140 }}>
-              <div style={{ fontSize: 28, marginBottom: 6 }}>🤖</div>
-              <p style={{ fontSize: 13, fontWeight: 700, color: '#4f7cff', margin: 0 }}>AI Will Create From Scratch</p>
-              <p style={{ fontSize: 11, color: '#94a3b8', margin: 0 }}>No room photo — pure AI imagination</p>
-            </div>
-          )}
-        </div>
-
-        {/* AI note */}
-        <div style={{ background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 12, padding: '14px 18px', marginBottom: 24, display: 'flex', gap: 12 }}>
-          <span style={{ fontSize: 18, flexShrink: 0 }}>⚡</span>
-          <p style={{ fontSize: 13, color: '#92400e', lineHeight: 1.7, margin: 0 }}>
-            <strong>What happens next:</strong> Claude AI crafts a detailed design concept, then DALL·E 3 generates a photorealistic render. Takes about 8–12 seconds.
-          </p>
-        </div>
-
-        {error && (
-          <div style={{ background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 12, padding: '12px 16px', fontSize: 14, color: '#dc2626', marginBottom: 16 }}>
-            ⚠️ {error}
-          </div>
-        )}
-
-        {/* Generate button */}
-        <button onClick={generate} disabled={loading}
-          style={{ ...s.btnPrimary, width: '100%', padding: '18px', fontSize: 16, opacity: loading ? 0.7 : 1, cursor: loading ? 'not-allowed' : 'pointer', borderRadius: 14, justifyContent: 'center' }}>
-          {loading ? (
-            <>
-              <div style={{ width: 20, height: 20, border: '3px solid rgba(255,255,255,0.3)', borderTopColor: 'white', borderRadius: '50%', animation: 'spin 0.8s linear infinite', flexShrink: 0 }} />
-              Claude AI is designing your room...
-            </>
-          ) : '✦ Generate My Design'}
-        </button>
-        <p style={{ fontSize: 12, color: '#94a3b8', textAlign: 'center', marginTop: 10 }}>Claude AI + DALL·E 3 · ~10 seconds · Free</p>
-
-        <NavButtons canNext={false} nextLabel="" />
-      </div>
-    )
+    return `<g ${rotT}><rect x="${px.toFixed(1)}" y="${py.toFixed(1)}" width="${pw.toFixed(1)}" height="${pd.toFixed(1)}"
+      fill="${fill}" stroke="${stroke}" stroke-width="${f.preserved?2:1.5}" rx="2" ${f.preserved?'stroke-dasharray="5,2"':''}/>
+      ${pw>28&&pd>16?`<text x="${cx.toFixed(1)}" y="${cy.toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="${fs}" fill="${darken(f.color,.5)}" font-family="Arial" font-weight="500">${lbl}</text>`:''}
+    </g>`
   }
 
-  /* ═══════════════════════════════════════════════════════════════
-     RESULT
-  ═══════════════════════════════════════════════════════════════ */
-  const Result = () => {
-    if (!result) return null
-    const d     = result.design
-    const dims  = result.dimensions
-    const hasFP = result.hasDimensions && result.floorPlan
+  const pieces = layout.furniture
+    .filter(f => f.type !== 'cabinets_upper')
+    .map(renderPiece).join('\n    ')
 
-    return (
-      <div ref={resultRef} style={{ marginTop: 36, borderTop: '2px solid #e0e7ff', paddingTop: 36 }}>
+  const doorX=ox+rpw-scX*3, doorY=oy+rph, dsr=scX*3
+  const ticksH = Array.from({length: Math.floor(layout.dimensions.widthFt/2)+1}, (_,i) => {
+    const x=ox+i*2*scX
+    return `<line x1="${x.toFixed(1)}" y1="${(oy-8).toFixed(1)}" x2="${x.toFixed(1)}" y2="${(oy-3).toFixed(1)}" stroke="#666" stroke-width="1"/>
+    <text x="${x.toFixed(1)}" y="${(oy-11).toFixed(1)}" text-anchor="middle" font-size="9" fill="#666" font-family="Arial">${i*2}'</text>`
+  }).join('')
+  const ticksV = Array.from({length: Math.floor(layout.dimensions.lengthFt/2)+1}, (_,i) => {
+    const y=oy+i*2*scY
+    return `<line x1="${(ox-8).toFixed(1)}" y1="${y.toFixed(1)}" x2="${(ox-3).toFixed(1)}" y2="${y.toFixed(1)}" stroke="#666" stroke-width="1"/>
+    <text x="${(ox-11).toFixed(1)}" y="${y.toFixed(1)}" text-anchor="end" dominant-baseline="middle" font-size="9" fill="#666" font-family="Arial">${i*2}'</text>`
+  }).join('')
 
-        {/* Header */}
-        <div style={{ textAlign: 'center', marginBottom: 28 }}>
-          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8, background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 100, padding: '6px 18px', fontSize: 13, fontWeight: 700, color: '#16a34a', marginBottom: 12 }}>
-            <span style={{ width: 7, height: 7, borderRadius: '50%', background: '#16a34a', display: 'inline-block' }} /> Your AI Design is Ready
-          </div>
-          <h2 style={{ fontSize: 26, fontWeight: 900, letterSpacing: '-0.8px', color: '#0f172a', marginBottom: 5 }}>
-            {d?.title || `${style} ${roomType}`}
-          </h2>
-          {d?.tagline && <p style={{ fontSize: 15, color: '#64748b' }}>{d.tagline}</p>}
-          {dims && (
-            <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, marginTop: 8, background: '#eef2ff', border: '1px solid #c7d2fe', borderRadius: 100, padding: '4px 14px', fontSize: 12, fontWeight: 600, color: '#4f7cff' }}>
-              📐 {dims.w}×{dims.l}ft · {dims.sqft} sq ft{dims.h ? ` · ${dims.h}ft ceiling` : ''}
-            </div>
-          )}
-        </div>
+  return `<svg viewBox="0 0 ${CW} ${CH}" xmlns="http://www.w3.org/2000/svg">
+  <rect width="${CW}" height="${CH}" fill="#FAFAF8"/>
+  <text x="${CW/2}" y="18" text-anchor="middle" font-size="12" font-weight="700" fill="#1a1a2e" font-family="Arial">
+    ${layout.style} ${layout.roomType} · ${layout.dimensions.widthFt}' × ${layout.dimensions.lengthFt}' · ${layout.dimensions.sqft} sq ft
+  </text>
+  ${ticksH}${ticksV}
+  <rect x="${ox}" y="${oy}" width="${rpw}" height="${rph}" fill="${lighten(layout.floor.color,.75)}" stroke="none"/>
+  <rect x="${ox}" y="${oy}" width="${rpw}" height="${rph}" fill="none" stroke="#1a1a2e" stroke-width="4" rx="1"/>
+  <line x1="${doorX.toFixed(1)}" y1="${doorY.toFixed(1)}" x2="${(doorX+dsr).toFixed(1)}" y2="${doorY.toFixed(1)}" stroke="#444" stroke-width="2.5"/>
+  <path d="M${doorX.toFixed(1)} ${doorY.toFixed(1)} A${dsr.toFixed(1)} ${dsr.toFixed(1)} 0 0 1 ${doorX.toFixed(1)} ${(doorY-dsr).toFixed(1)}" fill="none" stroke="#444" stroke-width="1" stroke-dasharray="4,2"/>
+  ${pieces}
+  <defs><marker id="arr" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto"><path d="M0,0 L0,6 L6,3 z" fill="#666"/></marker></defs>
+  <line x1="${ox}" y1="${(oy+rph+20).toFixed(1)}" x2="${(ox+rpw).toFixed(1)}" y2="${(oy+rph+20).toFixed(1)}" stroke="#666" stroke-width="1" marker-start="url(#arr)" marker-end="url(#arr)"/>
+  <text x="${(ox+rpw/2).toFixed(1)}" y="${(oy+rph+34).toFixed(1)}" text-anchor="middle" font-size="10" fill="#666" font-family="Arial">${layout.dimensions.widthFt} ft</text>
+  <line x1="${(ox+rpw+20).toFixed(1)}" y1="${oy}" x2="${(ox+rpw+20).toFixed(1)}" y2="${(oy+rph).toFixed(1)}" stroke="#666" stroke-width="1" marker-start="url(#arr)" marker-end="url(#arr)"/>
+  <text x="${(ox+rpw+34).toFixed(1)}" y="${(oy+rph/2).toFixed(1)}" text-anchor="middle" font-size="10" fill="#666" font-family="Arial" transform="rotate(-90,${(ox+rpw+34).toFixed(1)},${(oy+rph/2).toFixed(1)})">${layout.dimensions.lengthFt} ft</text>
+</svg>`
+}
 
-        {/* ── IMAGES SIDE BY SIDE ── */}
-        <div style={{ display: 'grid', gridTemplateColumns: hasFP ? '1fr 1fr' : '1fr', gap: 16, marginBottom: 20 }}>
+// ─── STAGE 4: PROMPT BUILDER ──────────────────────────────────────────────────
 
-          {/* 3D Live Viewer */}
-          <div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-              <div style={{ width: 22, height: 22, borderRadius: 7, background: 'linear-gradient(135deg,#4f7cff,#7c3aed)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, color: 'white', fontWeight: 800 }}>3D</div>
-              <span style={{ fontSize: 13, fontWeight: 700, color: '#0f172a' }}>3D Room Viewer</span>
-              <span style={{ fontSize: 11, color: '#94a3b8' }}>· drag to orbit</span>
-            </div>
-            {result.layoutJSON ? (
-              <RoomViewer3D
-                layoutJSON={result.layoutJSON}
-                style={style}
-                roomType={roomType}
-              />
-            ) : (
-              <div style={{ borderRadius: 16, overflow: 'hidden', boxShadow: '0 8px 32px rgba(0,0,0,0.12)', position: 'relative' }}>
-                <img src={result.image} alt={`${style} ${roomType}`}
-                  style={{ width: '100%', display: 'block', height: hasFP ? 340 : 420, objectFit: 'cover' }}
-                  onError={e => { (e.target as HTMLImageElement).src = 'https://images.unsplash.com/photo-1618219908412-a29a1bb7b86e?w=1200&q=85&auto=format&fit=crop' }} />
-              </div>
-            )}
-            {dims && (
-              <div style={{ marginTop: 6, fontSize: 11, color: '#64748b', textAlign: 'center' }}>
-                📐 {dims.w}×{dims.l}ft · {dims.sqft} sq ft{dims.h ? ` · ${dims.h}ft ceiling` : ''}
-              </div>
-            )}
-          </div>
+function buildRenderPrompt(layout: RoomLayoutJSON): { prompt: string; negative: string } {
+  const { roomType, style, dimensions, floor, walls, ceiling, furniture, lighting, mood, styleDetails } = layout
 
-          {/* 2D Floor Plan — shown inline if dimensions provided */}
-          {hasFP && result.floorPlan && (
-            <div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-                <div style={{ width: 22, height: 22, borderRadius: 7, background: 'linear-gradient(135deg,#10b981,#059669)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, color: 'white', fontWeight: 800 }}>2D</div>
-                <span style={{ fontSize: 13, fontWeight: 700, color: '#0f172a' }}>Floor Plan</span>
-                <span style={{ fontSize: 11, color: '#94a3b8' }}>· matches 3D render above</span>
-              </div>
-              <div style={{ borderRadius: 16, overflow: 'hidden', boxShadow: '0 8px 32px rgba(0,0,0,0.08)', border: '1px solid #e8eaf0', position: 'relative', background: '#f8faff' }}>
-                <img src={result.floorPlan} alt="2D floor plan"
-                  style={{ width: '100%', display: 'block', height: 340, objectFit: 'cover' }}
-                  onError={e => { (e.currentTarget.closest('div') as HTMLElement).style.display = 'none' }} />
-                <div style={{ position: 'absolute', top: 10, right: 10, background: 'rgba(16,185,129,0.15)', backdropFilter: 'blur(8px)', border: '1px solid rgba(16,185,129,0.3)', borderRadius: 8, padding: '4px 10px', fontSize: 11, fontWeight: 700, color: '#059669' }}>📐 Top View</div>
-              </div>
-              <a href={result.floorPlan} target="_blank" rel="noopener"
-                style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, marginTop: 8, padding: '9px', borderRadius: 10, background: 'linear-gradient(135deg,#10b981,#059669)', color: 'white', fontWeight: 700, fontSize: 13, textDecoration: 'none' }}>
-                ⬇ Save Floor Plan
-              </a>
-            </div>
-          )}
-        </div>
+  const mainPieces = furniture
+    .filter(f => f.type !== 'rug' && f.heightFt > 1.5)
+    .sort((a,b) => b.wFrac*b.dFrac - a.wFrac*a.dFrac)
+    .slice(0,6)
 
-        {/* Prompt to add dims if no floor plan */}
-        {!hasFP && (
-          <div style={{ background: '#f0f4ff', border: '1px solid #c7d2fe', borderRadius: 12, padding: '12px 16px', marginBottom: 16, display: 'flex', gap: 10, alignItems: 'center' }}>
-            <span style={{ fontSize: 18, flexShrink: 0 }}>📐</span>
-            <p style={{ fontSize: 13, color: '#4f7cff', margin: 0 }}>
-              <strong>Want a matching 2D floor plan?</strong> Go back to Step 1 and enter your room dimensions — both images will be generated side by side.
-            </p>
-          </div>
-        )}
+  const furnitureDesc = mainPieces.map(f => {
+    const pos = f.yFrac<.3 ? 'against far wall' : f.yFrac>.7 ? 'near foreground' : f.xFrac<.3 ? 'on left side' : f.xFrac>.6 ? 'on right side' : 'centered in room'
+    return `${f.label} (${f.color} ${f.material}, ${pos})`
+  }).join(', ')
 
-        {/* Action row */}
-        <div style={{ display: 'flex', gap: 10, marginBottom: 24, flexWrap: 'wrap' }}>
-          <button onClick={() => { navigator.clipboard.writeText(window.location.href); setCopied(true); setTimeout(() => setCopied(false), 2000) }} style={s.btnSecondary}>
-            {copied ? '✓ Copied!' : '🔗 Share'}
-          </button>
-          <button onClick={() => { setResult(null); setStep(0); window.scrollTo({ top: 0, behavior: 'smooth' }) }} style={s.btnSecondary}>🔄 Redesign</button>
-        </div>
+  const shape   = dimensions.widthFt/dimensions.lengthFt > 1.3 ? 'wide rectangular' : dimensions.widthFt/dimensions.lengthFt < .77 ? 'long narrow' : 'square proportioned'
+  const ceilFeel = dimensions.heightFt<=8 ? 'standard ceiling' : dimensions.heightFt<=10 ? 'high airy ceiling' : `dramatic ${dimensions.heightFt}ft soaring ceiling`
 
-        {/* Description + spatial note */}
-        {d?.description && (
-          <div style={{ background: '#f8faff', border: '1px solid #e0e7ff', borderRadius: 14, padding: '16px 20px', marginBottom: 16 }}>
-            <p style={{ fontSize: 14, color: '#374151', lineHeight: 1.8, margin: 0 }}>{d.description}</p>
-            {typeof d.spatialNote === 'string' && d.spatialNote && (
-              <p style={{ fontSize: 13, color: '#4f7cff', lineHeight: 1.7, margin: '10px 0 0', fontStyle: 'italic', borderTop: '1px solid #e0e7ff', paddingTop: 10 }}>📐 {d.spatialNote}</p>
-            )}
-          </div>
-        )}
+  const prompt = [
+    `ultra photorealistic interior design photograph of a ${style} ${roomType}`,
+    `${dimensions.sqft} sqft ${shape} room, ${dimensions.widthFt}ft wide × ${dimensions.lengthFt}ft long, ${ceilFeel}`,
+    `room contains: ${furnitureDesc}`,
+    `${walls.color} walls in ${walls.material}, ${floor.material} floor in ${floor.color}${floor.pattern ? ' ' + floor.pattern + ' pattern' : ''}`,
+    walls.accentWall ? walls.accentWall : '',
+    ceiling.feature  ? ceiling.feature  : '',
+    styleDetails,
+    `${mood} atmosphere`,
+    `lighting: ${lighting.natural}, ${lighting.ambient}, ${lighting.accent}`,
+    `wide angle corner shot showing entire ${roomType} with all furniture clearly visible`,
+    '8K ultra photorealistic render, Architectural Digest quality, professional interior photography',
+    'perfect balanced lighting, sharp focus throughout',
+    'no people, no text, no watermarks',
+  ].filter(Boolean).join('. ')
 
-        {/* Details grid */}
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 14, marginBottom: 16 }}>
-          {/* Colors */}
-          {d?.colors && (d.colors as string[]).length > 0 && (
-            <div style={{ background: 'white', border: '1px solid #e8eaf0', borderRadius: 14, padding: 16 }}>
-              <h4 style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '1px', margin: '0 0 12px' }}>Color Palette</h4>
-              {(d.colors as string[]).map((c, i) => {
-                const [hex, name] = c.includes(' - ') ? c.split(' - ') : [c, c]
-                return (
-                  <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-                    <div style={{ width: 22, height: 22, borderRadius: 6, background: hex.startsWith('#') ? hex : '#e2e8f0', border: '1px solid rgba(0,0,0,0.08)', flexShrink: 0 }} />
-                    <span style={{ fontSize: 11, color: '#374151' }}>{name}</span>
-                  </div>
-                )
-              })}
-            </div>
-          )}
-          {/* Furniture */}
-          {d?.furniture && (d.furniture as string[]).length > 0 && (
-            <div style={{ background: 'white', border: '1px solid #e8eaf0', borderRadius: 14, padding: 16 }}>
-              <h4 style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '1px', margin: '0 0 12px' }}>Key Pieces</h4>
-              {(d.furniture as string[]).map((f, i) => (
-                <div key={i} style={{ fontSize: 11, color: '#374151', marginBottom: 7, display: 'flex', gap: 6, lineHeight: 1.5 }}>
-                  <span style={{ color: '#4f7cff', fontWeight: 700, flexShrink: 0 }}>→</span>{f}
-                </div>
-              ))}
-            </div>
-          )}
-          {/* Materials + Brief */}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-            {d?.materials && (d.materials as string[]).length > 0 && (
-              <div style={{ background: 'white', border: '1px solid #e8eaf0', borderRadius: 14, padding: 16 }}>
-                <h4 style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '1px', margin: '0 0 10px' }}>Materials</h4>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                  {(d.materials as string[]).map((m, i) => (
-                    <span key={i} style={{ background: '#f0f4ff', border: '1px solid #c7d2fe', borderRadius: 20, padding: '3px 10px', fontSize: 11, fontWeight: 600, color: '#4f7cff' }}>{m}</span>
-                  ))}
-                </div>
-              </div>
-            )}
-            <div style={{ background: 'white', border: '1px solid #e8eaf0', borderRadius: 14, padding: 16 }}>
-              <h4 style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '1px', margin: '0 0 10px' }}>Design Brief</h4>
-              {[
-                { l: 'Style',   v: style },
-                { l: 'Room',    v: roomType },
-                { l: 'Size',    v: dims ? `${dims.w}×${dims.l}ft` : '—' },
-                { l: 'Ceiling', v: dims?.h ? `${dims.h}ft` : '—' },
-                { l: 'AI',      v: 'Claude + Replicate' },
-              ].map(({ l, v }) => (
-                <div key={l} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, padding: '5px 0', borderBottom: '1px solid #f8faff' }}>
-                  <span style={{ color: '#94a3b8' }}>{l}</span>
-                  <span style={{ color: '#0f172a', fontWeight: 700 }}>{v}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-
-        {/* Tips */}
-        {d?.tips && (d.tips as string[]).length > 0 && (
-          <div style={{ background: 'white', border: '1px solid #e8eaf0', borderRadius: 14, padding: 16, marginBottom: 16 }}>
-            <h4 style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '1px', margin: '0 0 12px' }}>Designer Tips</h4>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
-              {(d.tips as string[]).map((t, i) => (
-                <div key={i} style={{ fontSize: 12, color: '#374151', display: 'flex', gap: 8, lineHeight: 1.6 }}>
-                  <span style={{ color: '#16a34a', fontWeight: 800, flexShrink: 0 }}>✓</span>{t}
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        <button onClick={() => { setResult(null); setStep(0); window.scrollTo({ top: 0, behavior: 'smooth' }) }}
-          style={{ ...s.btnPrimary, justifyContent: 'center', width: '100%' }}>
-          ✦ Start New Design
-        </button>
-      </div>
-    )
+  const roomNeg: Record<string,string> = {
+    Bedroom:      'no living room sofa no coffee table no TV unit no dining table',
+    'Living Room':'no bed no headboard no wardrobe no bedroom furniture',
+    Kitchen:      'no bed no sofa no bedroom furniture',
+    Bathroom:     'no bed no sofa no dining table',
+    'Home Office':'no bed no sofa no dining furniture',
+    'Dining Room':'no bed no sofa no bedroom furniture no TV',
+    'Kids Room':  'no luxury adult furniture no office only',
+    'Master Suite':'no living room sofa no dining table no kitchen',
+    Studio:       'no large separate rooms',
   }
 
-  /* ═══════════════════════════════════════════════════════════════
-     RENDER
-  ═══════════════════════════════════════════════════════════════ */
-  return (
-    <div style={s.page}>
-      {/* NAV — identical to existing site */}
-      <nav style={s.nav}>
-        <div style={s.navIn}>
-          <Link href="/" style={s.logo}>
-            <div style={s.logoBox}>R</div>
-            <span style={s.logoTxt}>RoomGenie <span style={s.gradTxt}>AI</span></span>
-          </Link>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            <Link href="/dashboard" className="nav-link" style={{ textDecoration: 'none', padding: '8px 14px', borderRadius: 9, fontSize: 14, fontWeight: 500, color: '#5a6478' }}>Dashboard</Link>
-            <Link href="/pricing" className="nav-link" style={{ textDecoration: 'none', padding: '8px 14px', borderRadius: 9, fontSize: 14, fontWeight: 500, color: '#5a6478' }}>Pricing</Link>
-          </div>
-        </div>
-      </nav>
+  const negative = [
+    roomNeg[roomType] || '',
+    'no people, no faces, no text, no watermark, no logo',
+    'not blurry not distorted not overexposed not dark',
+    'not cartoon not illustration not painting not sketch',
+    'not outdoor not exterior not garden not street',
+    'not cluttered not messy not under construction',
+  ].filter(Boolean).join(', ')
 
-      <div style={s.wrap}>
-        {/* Page header */}
-        <div style={{ marginBottom: 32 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: '#94a3b8', marginBottom: 14 }}>
-            <Link href="/" style={{ textDecoration: 'none', color: 'inherit' }}>Home</Link>
-            <span>›</span>
-            <span style={{ color: '#64748b', fontWeight: 500 }}>Design Studio</span>
-          </div>
-          <h1 style={{ fontSize: 32, fontWeight: 900, letterSpacing: '-1px', color: '#0f172a', marginBottom: 6 }}>
-            AI Design Studio
-          </h1>
-          <p style={{ fontSize: 16, color: '#64748b' }}>Complete the guided steps below — then get your photorealistic AI-generated design</p>
-        </div>
+  return { prompt, negative }
+}
 
-        {/* Main wizard card */}
-        <div style={s.card}>
-          <Progress />
-          {step === 1 && <Step1 />}
-          {step === 2 && <Step2 />}
-          {step === 3 && <Step3 />}
-          {step === 4 && <Step4 />}
-        </div>
+// ─── STAGE 5: REPLICATE IMAGE GENERATION ─────────────────────────────────────
 
-        {/* Result — shown below the card */}
-        {result && (
-          <div style={{ ...s.card, marginTop: 32 }}>
-            <Result />
-          </div>
-        )}
-      </div>
+async function generateImage(prompt: string, negative: string, w: number, h: number): Promise<string | null> {
+  const token = process.env.REPLICATE_API_TOKEN
+  if (!token) { console.log('[Replicate] No token'); return null }
 
-      <style>{`
-        @keyframes spin { to { transform: rotate(360deg); } }
-        .nav-link:hover { background: #f0f4ff !important; color: #4f7cff !important; }
-        * { box-sizing: border-box; }
-      `}</style>
-    </div>
-  )
+  try {
+    const resp = await fetch('https://api.replicate.com/v1/models/stability-ai/sdxl/predictions', {
+      method:  'POST',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Prefer': 'wait=60' },
+      body: JSON.stringify({
+        input: { prompt, negative_prompt: negative, width: w, height: h,
+          num_inference_steps: 40, guidance_scale: 9, refine: 'expert_ensemble_refiner',
+          high_noise_frac: 0.8, apply_watermark: false }
+      })
+    })
+
+    if (!resp.ok) { console.error('[Replicate] Error:', resp.status, await resp.text()); return null }
+
+    const pred = await resp.json()
+    if (pred.status === 'succeeded' && pred.output?.[0]) return pred.output[0]
+    if (!pred.id) return null
+
+    for (let i = 0; i < 25; i++) {
+      await new Promise(r => setTimeout(r, 2500))
+      const poll   = await fetch(`https://api.replicate.com/v1/predictions/${pred.id}`, { headers: { 'Authorization': `Bearer ${token}` } })
+      const result = await poll.json()
+      if (result.status === 'succeeded' && result.output?.[0]) return result.output[0]
+      if (result.status === 'failed' || result.status === 'canceled') { console.error('[Replicate] Failed:', result.error); return null }
+    }
+    return null
+  } catch (e) { console.error('[Replicate] Exception:', e); return null }
+}
+
+function pollinationsFallback(prompt: string, w: number, h: number): string {
+  const seed = Date.now()
+  const enc  = encodeURIComponent(prompt.slice(0, 500))
+  return `https://image.pollinations.ai/prompt/${enc}?width=${w}&height=${h}&seed=${seed}&model=flux-pro&nologo=true&enhance=true&nocache=true`
+}
+
+// ─── MAIN HANDLER ─────────────────────────────────────────────────────────────
+
+export async function POST(req: Request) {
+  try {
+    const Anthropic = (await import('@anthropic-ai/sdk')).default
+    const anthropic  = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+
+    const formData   = await req.formData()
+    const style      = (formData.get('style')    as string) || 'Modern'
+    const roomType   = (formData.get('roomType') as string) || 'Living Room'
+    const custom     = (formData.get('prompt')   as string) || ''
+    const answersRaw = formData.get('answers')   as string
+    const roomFile   = formData.get('image')     as File | null
+    const furnFile   = formData.get('furniture_image') as File | null
+
+    let answers: Record<string, string> = {}
+    try { if (answersRaw) answers = JSON.parse(answersRaw) } catch { /**/ }
+
+    const dims = parseDims(formData)
+    const hasDims = dims.widthFt !== 14 || dims.lengthFt !== 16 // not just defaults
+
+    console.log(`[Pipeline] ${style} ${roomType} | ${dims.widthFt}×${dims.lengthFt}ft | ${dims.sqft}sqft`)
+
+    // ── STAGE 1: Vision Analysis (parallel) ──────────────────────────────────
+    const { roomContext, furnitureContext } = await analyzeImages(anthropic, roomFile, furnFile)
+    if (roomContext)     console.log('[Vision] Room:', roomContext.slice(0, 80))
+    if (furnitureContext) console.log('[Vision] Furniture:', furnitureContext.slice(0, 80))
+
+    // ── STAGE 2: Layout Planning ──────────────────────────────────────────────
+    const layout = await planLayout(anthropic, style, roomType, dims, answers, custom, roomContext, furnitureContext)
+    console.log(`[Layout] Generated ${layout.furniture.length} furniture pieces`)
+
+    // ── STAGE 3: SVG Floor Plan (deterministic from JSON) ────────────────────
+    const svgString       = generateFloorPlanSVG(layout)
+    const floorPlanDataUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgString)}`
+
+    // ── STAGE 4: Build photorealistic render prompt from the same JSON ────────
+    const { prompt, negative } = buildRenderPrompt(layout)
+    console.log('[Prompt]', prompt.slice(0, 120))
+
+    // ── STAGE 5: Generate photorealistic render (Replicate SDXL) ─────────────
+    // This is the "real room" image — same furniture/colors/layout as the 3D viewer
+    // Build an ultra-specific prompt that lists every piece of furniture with its
+    // exact position, color and material from the layout JSON
+    const furnitureLine = layout.furniture
+      .filter(f => f.type !== 'rug' && f.heightFt > 1.0)
+      .slice(0, 7)
+      .map(f => {
+        const pos = f.yFrac < 0.3 ? 'against far wall' : f.yFrac > 0.7 ? 'near foreground' : f.xFrac < 0.3 ? 'left side' : f.xFrac > 0.6 ? 'right side' : 'center'
+        return `${f.label} (${f.color} ${f.material}, ${pos})`
+      }).join(', ')
+
+    const photoPrompt = [
+      `photorealistic interior design render of a ${style} ${roomType}`,
+      `${layout.dimensions.sqft} square feet, ${layout.dimensions.widthFt}ft wide by ${layout.dimensions.lengthFt}ft long`,
+      layout.dimensions.heightFt >= 10 ? `soaring ${layout.dimensions.heightFt}ft ceiling` : `${layout.dimensions.heightFt}ft ceiling`,
+      `room contains: ${furnitureLine}`,
+      `floor: ${layout.floor.material} in ${layout.floor.color}`,
+      `walls: ${layout.walls.color} ${layout.walls.material}`,
+      layout.walls.accentWall ? layout.walls.accentWall : '',
+      layout.styleDetails,
+      `${layout.mood} atmosphere`,
+      `lighting: ${layout.lighting.natural}, ${layout.lighting.ambient}`,
+      answers.mood     ? `${answers.mood} mood`     : '',
+      answers.material ? `${answers.material} materials` : '',
+      custom || '',
+      'wide angle architectural photography showing entire room from corner',
+      'Architectural Digest magazine quality, 8K photorealistic, perfect lighting, sharp focus',
+      'no people, no text, no watermarks',
+    ].filter(Boolean).join('. ')
+
+    const photoNegative = [
+      negative,
+      'no cartoon, no illustration, no painting, not blurry, not dark',
+      'not outdoor, not exterior',
+    ].join(', ')
+
+    const photoImage = await generateImage(photoPrompt, photoNegative, 1344, 768)
+    const photoUrl   = photoImage || pollinationsFallback(photoPrompt, 1344, 768)
+    console.log('[Photo render]', photoImage ? 'Replicate success' : 'Pollinations fallback')
+
+    // ── STAGE 6: Return all 3 outputs ─────────────────────────────────────────
+    return NextResponse.json({
+      // Output 1: Photorealistic render (Replicate SDXL)
+      image:     photoUrl,
+      // Output 2: SVG floor plan (deterministic from JSON)
+      floorPlan: floorPlanDataUrl,
+      // Output 3: layoutJSON → drives the Three.js 3D viewer on the frontend
+      hasDimensions: true,
+      dimensions: {
+        w:    String(dims.widthFt),
+        l:    String(dims.lengthFt),
+        h:    String(dims.heightFt),
+        sqft: dims.sqft,
+      },
+      design: {
+        title:       layout.title       || `${style} ${roomType}`,
+        tagline:     layout.tagline     || 'A beautifully curated space.',
+        description: layout.description || `A stunning ${style} ${roomType}.`,
+        spatialNote: layout.spatialNotes || '',
+        colors:      layout.colors      || [],
+        furniture:   layout.furniture.filter(f=>f.type!=='rug').map(f=>f.label).slice(0,6),
+        tips:        layout.tips        || [],
+        materials:   layout.materials   || [],
+      },
+      layoutJSON: {
+        dimensions: layout.dimensions,
+        furniture:  layout.furniture,
+        floor:      layout.floor,
+        walls:      layout.walls,
+        palette:    layout.palette,
+      },
+    })
+
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'Pipeline failed'
+    console.error('[Pipeline] Error:', msg)
+    return NextResponse.json({ error: msg }, { status: 500 })
+  }
 }
