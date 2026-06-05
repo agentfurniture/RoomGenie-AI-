@@ -18,300 +18,667 @@ function hexToRgb(hex: string): [number, number, number] {
 }
 
 /* ─── 3D ROOM VIEWER ─────────────────────────────────────────────── */
-// ─── COLOUR HELPERS ───────────────────────────────────────────────────────────
-function hx(hex: string): [number,number,number] {
-  const h=(hex||'#888888').replace('#','')
-  if(h.length!==6)return[.55,.5,.48]
-  return[parseInt(h.slice(0,2),16)/255,parseInt(h.slice(2,4),16)/255,parseInt(h.slice(4,6),16)/255]
+// ─── COLOR UTILITIES ──────────────────────────────────────────────────────────
+function parseHex(hex: string): [number, number, number] {
+  const h = (hex || '#8B8680').replace('#', '').padEnd(6, '0')
+  return [parseInt(h.slice(0,2),16), parseInt(h.slice(2,4),16), parseInt(h.slice(4,6),16)]
 }
-function lx(hex:string,a=0.18):string{
-  const[r,g,b]=hx(hex);const f=(v:number)=>Math.round(Math.min((v+a)*255,255))
-  return`rgb(${f(r)},${f(g)},${f(b)})`
+function rgb(hex: string, lighten = 0, darken = 0): string {
+  const [r,g,b] = parseHex(hex)
+  const f = (v: number) => Math.max(0, Math.min(255, Math.round(v + lighten * 255 - darken * 255)))
+  return `rgb(${f(r)},${f(g)},${f(b)})`
 }
-function dx(hex:string,a=0.15):string{
-  const[r,g,b]=hx(hex);const f=(v:number)=>Math.round(Math.max((v-a)*255,0))
-  return`rgb(${f(r)},${f(g)},${f(b)})`
+function rgba(hex: string, alpha: number, lighten = 0, darken = 0): string {
+  const [r,g,b] = parseHex(hex)
+  const f = (v: number) => Math.max(0, Math.min(255, Math.round(v + lighten * 255 - darken * 255)))
+  return `rgba(${f(r)},${f(g)},${f(b)},${alpha})`
 }
-function mx(hex:string,a=0.08):string{
-  const[r,g,b]=hx(hex);const f=(v:number)=>Math.round(Math.min((v+a)*255,255))
-  return`rgb(${f(r)},${f(g)},${f(b)})`
+function toHex(r: number, g: number, b: number): string {
+  return '#' + [r,g,b].map(v => Math.max(0,Math.min(255,Math.round(v))).toString(16).padStart(2,'0')).join('')
 }
+function lightenHex(hex: string, amt: number): string {
+  const [r,g,b] = parseHex(hex)
+  return toHex(r + amt*255, g + amt*255, b + amt*255)
+}
+function darkenHex(hex: string, amt: number): string {
+  const [r,g,b] = parseHex(hex)
+  return toHex(r - amt*255, g - amt*255, b - amt*255)
+}
+function mixHex(hex1: string, hex2: string, t: number): string {
+  const [r1,g1,b1]=parseHex(hex1), [r2,g2,b2]=parseHex(hex2)
+  return toHex(r1+(r2-r1)*t, g1+(g2-g1)*t, b1+(b2-b1)*t)
+}
+
+// Number badge colors — distinct per index
+const BADGE_COLORS = ['#e53e3e','#dd6b20','#d69e2e','#38a169','#3182ce','#805ad5','#d53f8c','#2b6cb0','#276749','#744210']
+function badgeColor(i: number) { return BADGE_COLORS[i % BADGE_COLORS.length] }
 
 // ─── ISOMETRIC 3D ROOM VIEWER ─────────────────────────────────────────────────
 function RoomViewer3D({ layoutJSON, style, roomType, onCapture }: {
   layoutJSON: LayoutJSON; style: string; roomType: string; onCapture?: (b64: string) => void
 }) {
-  const svgRef    = useRef<SVGSVGElement>(null)
-  const rafIdRef  = useRef<number>(0)
-  const angleRef  = useRef<number>(0)
-  const [angleDeg, setAngleDeg] = useState(0)
-  const [spinning, setSpinning] = useState(true)
-  const spinRef = useRef(true)
+  const svgRef   = useRef<SVGSVGElement>(null)
+  const rafRef   = useRef<number>(0)
+  const degRef   = useRef<number>(225)  // start angle showing front-left corner like reference
+  const [deg, setDeg]       = useState(225)
+  const [paused, setPaused] = useState(false)
+  const pausedRef = useRef(false)
+  const lastTsRef = useRef(0)
 
-  // Auto-rotate
   useEffect(() => {
-    let last = 0
     function tick(ts: number) {
-      if (spinRef.current) {
-        const delta = ts - last
-        if (delta > 16) {
-          angleRef.current = (angleRef.current + 0.4) % 360
-          setAngleDeg(Math.round(angleRef.current))
-          last = ts
-        }
+      const delta = ts - lastTsRef.current
+      lastTsRef.current = ts
+      if (!pausedRef.current && delta < 200) {
+        degRef.current = (degRef.current + 0.35) % 360
+        setDeg(Math.round(degRef.current))
       }
-      rafIdRef.current = requestAnimationFrame(tick)
+      rafRef.current = requestAnimationFrame(tick)
     }
-    rafIdRef.current = requestAnimationFrame(tick)
-    return () => cancelAnimationFrame(rafIdRef.current)
+    rafRef.current = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(rafRef.current)
   }, [])
 
-  const VW = 680, VH = 460
+  const VW = 700, VH = 480
   const { widthFt: W, lengthFt: L, heightFt: H } = layoutJSON.dimensions
-  const wallC  = layoutJSON.walls.color  || '#F0EDE8'
+  const wallC  = layoutJSON.walls.color  || '#F2EDE8'
   const floorC = layoutJSON.floor.color  || '#C4A882'
   const floorMat = layoutJSON.floor.material || 'hardwood'
 
-  // Isometric projection — rotates around Y axis
-  function project(rx: number, ry: number, rz: number): [number, number] {
-    const rad = (angleRef.current * Math.PI) / 180
-    // Rotate around room center
-    const cx2 = W / 2, cz2 = L / 2
-    const dx2 = rx - cx2, dz2 = rz - cz2
-    const rx2 = dx2 * Math.cos(rad) - dz2 * Math.sin(rad) + cx2
-    const rz2 = dx2 * Math.sin(rad) + dz2 * Math.cos(rad) + cz2
-    const scale = Math.min(VW / (W + L + 4) * 0.72, VH / (H + (W + L) * 0.5 + 4) * 0.82)
-    const ix = (rx2 - rz2) * 0.7 * scale
-    const iy = (rx2 + rz2) * 0.32 * scale - ry * scale
-    return [VW / 2 + ix, VH * 0.68 + iy]
+  // Convert 3D room coords → SVG 2D via isometric-style projection with Y-rotation
+  function proj(rx: number, ry: number, rz: number): [number, number] {
+    const rad = degRef.current * Math.PI / 180
+    const cx = W/2, cz = L/2
+    const dx = rx - cx, dz = rz - cz
+    const rx2 = dx * Math.cos(rad) - dz * Math.sin(rad) + cx
+    const rz2 = dx * Math.sin(rad) + dz * Math.cos(rad) + cz
+    // Isometric projection
+    const sc  = Math.min(VW/(W+L+2)*0.68, VH/(H+(W+L)*0.45+2)*0.78)
+    const ix  = (rx2 - rz2) * 0.65 * sc
+    const iy  = (rx2 + rz2) * 0.30 * sc - ry * sc
+    return [VW/2 + ix, VH*0.70 + iy]
   }
 
-  function poly(pts:[number,number][], fill:string, stroke:string, sw=1, opacity=1, dash='') {
+  function P(pts: [number,number][], fill: string, stroke: string, sw = 0.8, op = 1, dash = '') {
     return <polygon points={pts.map(p=>p.join(',')).join(' ')}
-      fill={fill} stroke={stroke} strokeWidth={sw} opacity={opacity} strokeDasharray={dash}/>
+      fill={fill} stroke={stroke} strokeWidth={sw} opacity={op} strokeDasharray={dash}/>
   }
 
-  // Room shell
-  function shell() {
-    const f00=project(0,0,0),fW0=project(W,0,0),fWL=project(W,0,L),f0L=project(0,0,L)
-    const c00=project(0,H,0),cW0=project(W,H,0),cWL=project(W,H,L),c0L=project(0,H,L)
+  // Determine visible walls based on rotation angle
+  const a = degRef.current % 360
+  const showBackWall  = true  // always visible
+  const showLeftWall  = a < 180
+  const showRightWall = a >= 180
 
-    // Determine which walls face viewer based on angle
-    const a = ((angleRef.current % 360) + 360) % 360
+  // ── ROOM SHELL ──────────────────────────────────────────────────────────────
+  function Shell() {
+    const f00=proj(0,0,0), fW0=proj(W,0,0), fWL=proj(W,0,L), f0L=proj(0,0,L)
+    const c00=proj(0,H,0), cW0=proj(W,H,0), cWL=proj(W,H,L), c0L=proj(0,H,L)
 
-    // Floor texture lines
+    // Floor with wood grain or tile pattern
+    const floorFill = lightenHex(floorC, 0.08)
     const floorLines: JSX.Element[] = []
     if (floorMat === 'hardwood' || floorMat === 'wood') {
-      for (let i = 1; i < W * 2; i++) {
+      for (let i = 0; i <= W * 2; i++) {
         const x = i * 0.5
-        if (x <= W) floorLines.push(<line key={`fl${i}`}
-          x1={project(x,0,0)[0]} y1={project(x,0,0)[1]}
-          x2={project(x,0,L)[0]} y2={project(x,0,L)[1]}
-          stroke={dx(floorC,0.08)} strokeWidth="0.4" opacity="0.45"/>)
+        if (x > W) break
+        const a2 = proj(x,0,0), b2 = proj(x,0,L)
+        floorLines.push(<line key={`fh${i}`} x1={a2[0]} y1={a2[1]} x2={b2[0]} y2={b2[1]} stroke={darkenHex(floorC,0.08)} strokeWidth="0.5" opacity="0.35"/>)
+      }
+      for (let j = 0; j <= L; j += 1.5) {
+        const a2 = proj(0,0,j), b2 = proj(W,0,j)
+        floorLines.push(<line key={`fv${j}`} x1={a2[0]} y1={a2[1]} x2={b2[0]} y2={b2[1]} stroke={darkenHex(floorC,0.05)} strokeWidth="0.4" opacity="0.25"/>)
+      }
+    } else if (floorMat === 'tile' || floorMat === 'marble') {
+      for (let i = 0; i <= W; i += 2) {
+        const a2=proj(i,0,0),b2=proj(i,0,L)
+        floorLines.push(<line key={`ti${i}`} x1={a2[0]} y1={a2[1]} x2={b2[0]} y2={b2[1]} stroke={darkenHex(floorC,0.12)} strokeWidth="0.8" opacity="0.4"/>)
+      }
+      for (let j = 0; j <= L; j += 2) {
+        const a2=proj(0,0,j),b2=proj(W,0,j)
+        floorLines.push(<line key={`tj${j}`} x1={a2[0]} y1={a2[1]} x2={b2[0]} y2={b2[1]} stroke={darkenHex(floorC,0.12)} strokeWidth="0.8" opacity="0.4"/>)
       }
     }
 
-    // Wall panels
-    const wallPanels: JSX.Element[] = []
-    if (a < 180) {
-      // Back wall (far, z=0)
-      wallPanels.push(<g key="bw">{poly([f00,fW0,cW0,c00], dx(wallC,0.04), dx(wallC,0.15),1.2)}
-        {/* Panel moulding */}
-        {[0.25,0.5,0.75].map(xf=>{
-          const x=xf*W
-          const b0=project(x-W*.1,H*.15,0),b1=project(x+W*.1,H*.15,0)
-          const b2=project(x+W*.1,H*.72,0),b3=project(x-W*.1,H*.72,0)
-          return<polygon key={xf} points={[b0,b1,b2,b3].map(p=>p.join(',')).join(' ')} fill="none" stroke={dx(wallC,0.12)} strokeWidth="0.7" opacity="0.5"/>
-        })}
-      </g>)
+    // Wall panel moulding helper
+    function wallPanel(pts: [number,number][], inset = 0.07) {
+      // Returns inner rectangle slightly inset from the face for decorative panel
+      const xs = pts.map(p=>p[0]), ys = pts.map(p=>p[1])
+      const cxp = xs.reduce((a,b)=>a+b,0)/pts.length
+      const cyp = ys.reduce((a,b)=>a+b,0)/pts.length
+      const inner = pts.map(p => [cxp + (p[0]-cxp)*(1-inset), cyp + (p[1]-cyp)*(1-inset)] as [number,number])
+      return <polygon points={inner.map(p=>p.join(',')).join(' ')} fill="none" stroke={rgba(wallC,0.35,0,-0.08)} strokeWidth="0.7"/>
     }
-    if (a >= 180 || true) {
-      // Side wall (z=L)
-      wallPanels.push(<g key="sw">{poly([f0L,f00,c00,c0L], lx(wallC,0.04), dx(wallC,0.15),1.2)}</g>)
-    }
+
+    // Back wall faces
+    const backWall1 = [f00,fW0,cW0,c00]
+    const leftWall  = [f0L,f00,c00,c0L]
+    const rightWall = [fW0,fWL,cWL,cW0]
+
+    // Window on back wall (centered upper third)
+    const wWall = 'back'
+    const winX0=W*.3, winX1=W*.7, winY0=H*.22, winY1=H*.80
+    const wp=[proj(winX0,winY0,0),proj(winX1,winY0,0),proj(winX1,winY1,0),proj(winX0,winY1,0)]
+    const winMid = [(wp[0][0]+wp[2][0])/2, (wp[0][1]+wp[2][1])/2] as [number,number]
+    // Window frame subdivisions
+    const wmidX = (winX0+winX1)/2
+    const wH3 = winY0+(winY1-winY0)*0.45
+    const winPanes = [
+      [proj(winX0,winY0,0),proj(wmidX,winY0,0),proj(wmidX,wH3,0),proj(winX0,wH3,0)],
+      [proj(wmidX,winY0,0),proj(winX1,winY0,0),proj(winX1,wH3,0),proj(wmidX,wH3,0)],
+      [proj(winX0,wH3,0),proj(wmidX,wH3,0),proj(wmidX,winY1,0),proj(winX0,winY1,0)],
+      [proj(wmidX,wH3,0),proj(winX1,wH3,0),proj(winX1,winY1,0),proj(wmidX,winY1,0)],
+    ]
+
+    // Ceiling
+    const ceilPts = [c00,cW0,cWL,c0L]
 
     return (
       <g>
         {/* Floor */}
-        {poly([f00,fW0,fWL,f0L], lx(floorC,0.05), dx(floorC,0.2),1.5)}
+        <polygon points={[f00,fW0,fWL,f0L].map(p=>p.join(',')).join(' ')} fill={floorFill} stroke={darkenHex(floorC,0.2)} strokeWidth="1.5"/>
         {floorLines}
-        {/* Walls */}
-        {wallPanels}
+
+        {/* Back wall */}
+        {showBackWall && <>
+          <polygon points={backWall1.map(p=>p.join(',')).join(' ')} fill={rgb(wallC,0.03)} stroke={darkenHex(wallC,0.12)} strokeWidth="1"/>
+          {/* Wall panels - elegant grid like reference image */}
+          {[0,1,2].map(col => {
+            const x0=W*(.08+col*.3), x1=W*(.28+col*.3)
+            const pts: [number,number][] = [proj(x0,H*.08,0),proj(x1,H*.08,0),proj(x1,H*.88,0),proj(x0,H*.88,0)]
+            return <g key={col}>
+              <polygon points={pts.map(p=>p.join(',')).join(' ')} fill="none" stroke={rgba(wallC,0.4,0,0.07)} strokeWidth="1"/>
+              {wallPanel(pts, 0.08)}
+            </g>
+          })}
+          {/* Window */}
+          <polygon points={wp.map(p=>p.join(',')).join(' ')} fill="rgba(200,230,255,0.18)" stroke={rgba(wallC,0.9,0,0.05)} strokeWidth="1.5"/>
+          {winPanes.map((pane,i)=><polygon key={i} points={pane.map(p=>p.join(',')).join(' ')} fill="rgba(180,220,255,0.14)" stroke={rgba(wallC,0.7,0,0.05)} strokeWidth="0.8"/>)}
+          {/* Window frame - outer */}
+          <polygon points={wp.map(p=>p.join(',')).join(' ')} fill="none" stroke={darkenHex(wallC,0.15)} strokeWidth="1.8"/>
+          {/* Curtains */}
+          {[{x:winX0-W*.04,w:W*.06},{x:winX1,w:W*.06}].map((c2,ci)=>{
+            const ct=[proj(c2.x,winY0*.8,0),proj(c2.x+c2.w,winY0*.8,0),proj(c2.x+c2.w,winY1,0),proj(c2.x,winY1,0)]
+            return <polygon key={ci} points={ct.map(p=>p.join(',')).join(' ')}
+              fill="rgba(180,140,80,0.6)" stroke="rgba(150,110,50,0.5)" strokeWidth="0.6"/>
+          })}
+        </>}
+
+        {/* Left wall */}
+        {showLeftWall && <>
+          <polygon points={leftWall.map(p=>p.join(',')).join(' ')} fill={rgb(wallC,0.06)} stroke={darkenHex(wallC,0.15)} strokeWidth="1"/>
+          {[0,1].map(row=>([H*.1+row*H*.5]).map(y0=>{
+            const pts2: [number,number][]=[proj(0,y0,L*.1),proj(0,y0,L*.9),proj(0,y0+H*.35,L*.9),proj(0,y0+H*.35,L*.1)]
+            return<g key={`lw${row}`}><polygon points={pts2.map(p=>p.join(',')).join(' ')} fill="none" stroke={rgba(wallC,0.35,0,0.06)} strokeWidth="0.7"/>{wallPanel(pts2)}</g>
+          }))}
+        </>}
+
+        {/* Right wall */}
+        {showRightWall && <>
+          <polygon points={rightWall.map(p=>p.join(',')).join(' ')} fill={rgb(wallC,0,0.02)} stroke={darkenHex(wallC,0.12)} strokeWidth="1"/>
+        </>}
+
+        {/* Skirting boards */}
+        <polygon points={[f00,fW0,proj(W,.14,0),proj(0,.14,0)].map(p=>p.join(',')).join(' ')} fill={lightenHex(wallC,0.1)} stroke={darkenHex(wallC,0.1)} strokeWidth="0.6"/>
+        {showLeftWall && <polygon points={[f0L,f00,proj(0,.14,0),proj(0,.14,L)].map(p=>p.join(',')).join(' ')} fill={lightenHex(wallC,0.12)} stroke={darkenHex(wallC,0.1)} strokeWidth="0.6"/>}
+
+        {/* Ceiling */}
+        <polygon points={ceilPts.map(p=>p.join(',')).join(' ')} fill="rgba(255,255,255,0.55)" stroke={darkenHex(wallC,0.08)} strokeWidth="0.8"/>
         {/* Ceiling edges */}
-        <line x1={c00[0]} y1={c00[1]} x2={cW0[0]} y2={cW0[1]} stroke={dx(wallC,0.1)} strokeWidth="1.5"/>
-        <line x1={c00[0]} y1={c00[1]} x2={c0L[0]} y2={c0L[1]} stroke={dx(wallC,0.1)} strokeWidth="1.5"/>
-        <line x1={cW0[0]} y1={cW0[1]} x2={cWL[0]} y2={cWL[1]} stroke={dx(wallC,0.08)} strokeWidth="0.8" strokeDasharray="4,2"/>
-        <line x1={c0L[0]} y1={c0L[1]} x2={cWL[0]} y2={cWL[1]} stroke={dx(wallC,0.08)} strokeWidth="0.8" strokeDasharray="4,2"/>
-        {/* Vertical edges */}
-        <line x1={f00[0]} y1={f00[1]} x2={c00[0]} y2={c00[1]} stroke={dx(wallC,0.2)} strokeWidth="1.5"/>
-        <line x1={fW0[0]} y1={fW0[1]} x2={cW0[0]} y2={cW0[1]} stroke={dx(wallC,0.12)} strokeWidth="1"/>
-        <line x1={f0L[0]} y1={f0L[1]} x2={c0L[0]} y2={c0L[1]} stroke={dx(wallC,0.12)} strokeWidth="1"/>
-        {/* Window */}
-        {(()=>{
-          const wy0=H*.22,wy1=H*.82,wz0=L*.35,wz1=L*.65
-          const wp=[project(W,wy0,wz0),project(W,wy0,wz1),project(W,wy1,wz1),project(W,wy1,wz0)]
-          return<>
-            {poly(wp,'rgba(180,220,255,0.22)','rgba(180,220,255,0.8)',1.2)}
-            <line x1={project(W,wy0,(wz0+wz1)/2)[0]} y1={project(W,wy0,(wz0+wz1)/2)[1]} x2={project(W,wy1,(wz0+wz1)/2)[0]} y2={project(W,wy1,(wz0+wz1)/2)[1]} stroke="rgba(200,230,255,0.7)" strokeWidth="0.8"/>
-          </>
-        })()}
-        {/* Skirting */}
-        {poly([f00,fW0,project(W,.12,0),project(0,.12,0)], dx(wallC,0.02),dx(wallC,0.15),.6)}
-        {poly([f00,f0L,project(0,.12,L),project(0,.12,0)], lx(wallC,0.06),dx(wallC,0.12),.6)}
-        {/* Ceiling spot lights */}
+        <line x1={c00[0]} y1={c00[1]} x2={cW0[0]} y2={cW0[1]} stroke={darkenHex(wallC,0.15)} strokeWidth="1.5"/>
+        <line x1={c00[0]} y1={c00[1]} x2={c0L[0]} y2={c0L[1]} stroke={darkenHex(wallC,0.15)} strokeWidth="1.5"/>
+        <line x1={cW0[0]} y1={cW0[1]} x2={cWL[0]} y2={cWL[1]} stroke={darkenHex(wallC,0.1)} strokeWidth="0.8" strokeDasharray="5,3"/>
+        <line x1={c0L[0]} y1={c0L[1]} x2={cWL[0]} y2={cWL[1]} stroke={darkenHex(wallC,0.1)} strokeWidth="0.8" strokeDasharray="5,3"/>
+        {/* Vertical wall edges */}
+        <line x1={f00[0]} y1={f00[1]} x2={c00[0]} y2={c00[1]} stroke={darkenHex(wallC,0.22)} strokeWidth="2"/>
+        <line x1={fW0[0]} y1={fW0[1]} x2={cW0[0]} y2={cW0[1]} stroke={darkenHex(wallC,0.12)} strokeWidth="1.2"/>
+        <line x1={f0L[0]} y1={f0L[1]} x2={c0L[0]} y2={c0L[1]} stroke={darkenHex(wallC,0.12)} strokeWidth="1.2"/>
+
+        {/* Ceiling recessed lights */}
         {[.25,.5,.75].map((xf,i)=>{
-          const p=project(xf*W,H,L*.5)
-          return<g key={i}>
-            <ellipse cx={p[0]} cy={p[1]} rx={4} ry={2} fill="rgba(255,250,220,0.9)" stroke="rgba(200,190,160,0.5)" strokeWidth="0.5"/>
-            <ellipse cx={p[0]} cy={p[1]+3} rx={12} ry={6} fill="rgba(255,248,200,0.08)"/>
+          const p2=proj(xf*W,H,L*.5)
+          const lp=proj(xf*W,H*.92,L*.5)
+          return <g key={i}>
+            <ellipse cx={p2[0]} cy={p2[1]} rx={5} ry={2.5} fill="#fff8e8" stroke="#e0d090" strokeWidth="0.5"/>
+            <ellipse cx={lp[0]} cy={lp[1]} rx={20} ry={8} fill="rgba(255,248,200,0.06)"/>
           </g>
         })}
+
+        {/* Dimension labels */}
+        {(()=>{
+          const a2=proj(0,0,L), b2=proj(W,0,L)
+          const mid: [number,number] = [(a2[0]+b2[0])/2,(a2[1]+b2[1])/2]
+          return <text x={mid[0]} y={mid[1]+18} textAnchor="middle" fontSize="11" fill={darkenHex(floorC,0.35)} fontFamily="Arial,sans-serif" fontWeight="600">{W} ft</text>
+        })()}
+        {(()=>{
+          const a2=proj(0,0,0), b2=proj(0,0,L)
+          const mid: [number,number] = [(a2[0]+b2[0])/2-18,(a2[1]+b2[1])/2]
+          return <text x={mid[0]} y={mid[1]} textAnchor="middle" fontSize="11" fill={darkenHex(floorC,0.35)} fontFamily="Arial,sans-serif" fontWeight="600" transform={`rotate(-32,${mid[0]},${mid[1]})`}>{L} ft</text>
+        })()}
       </g>
     )
   }
 
-  // Render one furniture piece as isometric box
-  function renderPiece(f: LayoutJSON['furniture'][0], idx: number) {
+  // ── FURNITURE PIECES ────────────────────────────────────────────────────────
+  function FurniturePiece({ f, idx }: { f: LayoutJSON['furniture'][0]; idx: number }) {
     const x=f.xFrac*W, z=f.yFrac*L
-    const fw=Math.max(f.wFrac*W,.1), fd=Math.max(f.dFrac*L,.1)
-    const fh=Math.max(f.heightFt,.1)
+    const fw=Math.max(f.wFrac*W, 0.12), fd=Math.max(f.dFrac*L, 0.12)
+    const fh=Math.max(f.heightFt, 0.1)
     const fc=f.color||'#8B8680'
-    const num=idx+1
+    const mat=(f.material||'').toLowerCase()
+    const shiny = ['marble','metal','glass','chrome','brass','gold'].some(m=>mat.includes(m))
+    const warm  = ['wood','walnut','oak','cherry','mahogany'].some(m=>mat.includes(m))
 
-    if(f.type==='rug'){
-      const ps=[project(x,.01,z),project(x+fw,.01,z),project(x+fw,.01,z+fd),project(x,.01,z+fd)]
-      const mid=project(x+fw/2,.01,z+fd/2)
-      return<g key={f.id}>
-        {poly(ps,fc+'55',dx(fc,.1),1,.8,'4,3')}
-        <text x={mid[0]} y={mid[1]+3} textAnchor="middle" fontSize="7" fill={dx(fc,.4)} fontFamily="Arial,sans-serif">{f.label}</text>
+    // Color variations for realistic faces
+    const topC  = lightenHex(fc, shiny ? 0.25 : 0.14)
+    const leftC = darkenHex(fc, 0.10)
+    const rightC= darkenHex(fc, 0.18)
+    const bc     = badgeColor(idx)
+
+    // Common face helpers
+    const top  = [proj(x,fh,z), proj(x+fw,fh,z), proj(x+fw,fh,z+fd), proj(x,fh,z+fd)]
+    const left = [proj(x,0,z+fd), proj(x+fw,0,z+fd), proj(x+fw,fh,z+fd), proj(x,fh,z+fd)]
+    const right= [proj(x+fw,0,z), proj(x+fw,0,z+fd), proj(x+fw,fh,z+fd), proj(x+fw,fh,z)]
+
+    // Badge position — top center of furniture
+    const bpt  = proj(x+fw*.5, fh+.25, z+fd*.5)
+
+    const badge = <g>
+      <circle cx={bpt[0]} cy={bpt[1]} r={9} fill={bc} stroke="white" strokeWidth="1.5" opacity="0.95"/>
+      <text x={bpt[0]} y={bpt[1]+3.5} textAnchor="middle" fontSize="9" fill="white" fontFamily="Arial,sans-serif" fontWeight="800">{idx+1}</text>
+    </g>
+
+    if (f.type==='rug') {
+      const rpts=[proj(x,.03,z),proj(x+fw,.03,z),proj(x+fw,.03,z+fd),proj(x,.03,z+fd)]
+      const rmid=proj(x+fw*.5,.03,z+fd*.5)
+      return <g>
+        <polygon points={rpts.map(p=>p.join(',')).join(' ')} fill={rgba(fc,0.7)} stroke={darkenHex(fc,0.2)} strokeWidth="0.8" strokeDasharray="3,2"/>
+        {/* Rug border */}
+        {(()=>{
+          const ins=0.08
+          const ir=[proj(x+fw*ins,.04,z+fd*ins),proj(x+fw*(1-ins),.04,z+fd*ins),proj(x+fw*(1-ins),.04,z+fd*(1-ins)),proj(x+fw*ins,.04,z+fd*(1-ins))]
+          return <polygon points={ir.map(p=>p.join(',')).join(' ')} fill="none" stroke={darkenHex(fc,0.15)} strokeWidth="0.5"/>
+        })()}
+        <text x={rmid[0]} y={rmid[1]+3} textAnchor="middle" fontSize="8" fill={darkenHex(fc,0.45)} fontFamily="Arial,sans-serif">{f.label}</text>
       </g>
     }
 
-    // Box faces
-    const t=[project(x,fh,z),project(x+fw,fh,z),project(x+fw,fh,z+fd),project(x,fh,z+fd)]
-    const lf=[project(x,0,z+fd),project(x+fw,0,z+fd),project(x+fw,fh,z+fd),project(x,fh,z+fd)]
-    const rf=[project(x+fw,0,z),project(x+fw,0,z+fd),project(x+fw,fh,z+fd),project(x+fw,fh,z)]
-    const mid=project(x+fw/2,fh,z+fd/2)
-
-    // Number badge position (top center)
-    const badge=project(x+fw/2,fh+.2,z+fd/2)
-
-    return<g key={f.id}>
-      {/* Left face */}
-      {poly(lf, dx(fc,.12), dx(fc,.25), .7)}
-      {/* Right face */}
-      {poly(rf, dx(fc,.06), dx(fc,.22), .7)}
-      {/* Top face */}
-      {poly(t, lx(fc,.12), dx(fc,.18), .8)}
-
-      {/* Special details */}
-      {(f.type==='bed'||f.type==='murphy_bed')&&<>
-        {/* Headboard */}
-        {poly([project(x,0,z),project(x+fw,0,z),project(x+fw,fh*.7,z),project(x,fh*.7,z)],dx(fc,.04),dx(fc,.2),.7)}
-        {/* Pillows */}
-        {[.25,.65].map((px,pi)=>{
-          const pw=fw*.22,pd=fd*.2,ph=fh*.15
-          const pps=[project(x+fw*px,fh,z+fd*.08),project(x+fw*px+pw,fh,z+fd*.08),project(x+fw*px+pw,fh,z+fd*.08+pd),project(x+fw*px,fh,z+fd*.08+pd)]
-          return<polygon key={pi} points={pps.map(p=>p.join(',')).join(' ')} fill="rgba(250,248,245,0.9)" stroke={dx(fc,.15)} strokeWidth=".5"/>
+    // Plant
+    if (f.type==='plant'||f.type==='floor_plant') {
+      const stem=proj(x+fw*.5,0,z+fd*.5)
+      const top2=proj(x+fw*.5,fh,z+fd*.5)
+      const pot=[proj(x+fw*.3,0,z+fd*.3),proj(x+fw*.7,0,z+fd*.3),proj(x+fw*.7,fh*.3,z+fd*.7),proj(x+fw*.3,fh*.3,z+fd*.7)]
+      return <g>
+        {P(pot,'#8B6A3E','#6B4A1E',.8)}
+        <line x1={stem[0]} y1={stem[1]} x2={top2[0]} y2={top2[1]} stroke="#4a7c40" strokeWidth="1.5"/>
+        {[0,.3,.6,1].map(t=>{
+          const lp=proj(x+fw*.5,fh*t+fh*.3,z+fd*.5)
+          return[-.35,-.2,.2,.35].map((dx2,li)=>{
+            const lx2=proj(x+fw*.5+dx2,fh*(t+.15)+fh*.3,z+fd*.5+Math.abs(dx2)*.3)
+            return <line key={`${t}${li}`} x1={lp[0]} y1={lp[1]} x2={lx2[0]} y2={lx2[1]} stroke={`hsl(${115+li*8},55%,${30+t*15}%)`} strokeWidth="2.5" strokeLinecap="round"/>
+          })
         })}
-      </>}
-      {(f.type==='sofa'||f.type==='chaise')&&<>
-        {/* Back cushion strip */}
-        {poly([project(x,fh*.5,z),project(x+fw,fh*.5,z),project(x+fw,fh,z),project(x,fh,z)],dx(fc,.04),dx(fc,.2),.6)}
-        {/* Seat cushions */}
+      </g>
+    }
+
+    // Floor lamp
+    if (f.type==='floor_lamp') {
+      const base=proj(x+fw*.5,0,z+fd*.5)
+      const top2=proj(x+fw*.5,fh*.88,z+fd*.5)
+      const shade0=proj(x+fw*.15,fh*.72,z+fd*.2)
+      const shade1=proj(x+fw*.85,fh*.72,z+fd*.2)
+      const shade2=proj(x+fw*.85,fh,z+fd*.8)
+      const shade3=proj(x+fw*.15,fh,z+fd*.8)
+      return <g>
+        <polygon points={[shade0,shade1,shade2,shade3].map(p=>p.join(',')).join(' ')} fill="rgba(240,220,160,0.82)" stroke="rgba(180,150,80,0.6)" strokeWidth="0.8"/>
+        <line x1={base[0]} y1={base[1]} x2={top2[0]} y2={top2[1]} stroke="#a08060" strokeWidth="1.8" strokeLinecap="round"/>
+        <ellipse cx={base[0]} cy={base[1]} rx={7} ry={3} fill="#7a6040" stroke="#5a4020" strokeWidth="0.7"/>
+        <ellipse cx={proj(x+fw*.5,fh*.9,z+fd*.5)[0]} cy={proj(x+fw*.5,fh*.9,z+fd*.5)[1]} rx={16} ry={7} fill="rgba(255,240,180,0.12)"/>
+        {badge}
+      </g>
+    }
+
+    // Chandelier
+    if (f.type==='chandelier') {
+      const cp=proj(x+fw*.5,fh,z+fd*.5)
+      const arms=6
+      return <g>
+        <ellipse cx={cp[0]} cy={cp[1]} rx={12} ry={6} fill="rgba(220,180,80,0.9)" stroke="#c0a040" strokeWidth="0.8"/>
+        {Array.from({length:arms},(_,i)=>{
+          const angle=i/arms*Math.PI*2
+          const ep=proj(x+fw*.5+Math.cos(angle)*fw*.4,fh-.8,z+fd*.5+Math.sin(angle)*fd*.4)
+          return <g key={i}>
+            <line x1={cp[0]} y1={cp[1]} x2={ep[0]} y2={ep[1]} stroke="#c8a040" strokeWidth="0.8"/>
+            <circle cx={ep[0]} cy={ep[1]} r={3} fill="rgba(255,240,160,0.95)" stroke="#e0b840" strokeWidth="0.5"/>
+          </g>
+        })}
+        <circle cx={cp[0]} cy={cp[1]} r={6} fill="rgba(220,180,80,0.95)" stroke="#a07820" strokeWidth="1"/>
+        {badge}
+      </g>
+    }
+
+    // Sofa / chaise
+    if (f.type==='sofa'||f.type==='chaise') {
+      const armH=fh*.52, seatH=fh*.4, backH=fh
+      // Back
+      const back=[proj(x,backH*.35,z),proj(x+fw,backH*.35,z),proj(x+fw,backH,z),proj(x,backH,z)]
+      const backTop=[proj(x,backH,z),proj(x+fw,backH,z),proj(x+fw,backH,z+fd*.2),proj(x,backH,z+fd*.2)]
+      // Seat
+      const seat=proj(x,seatH,z)
+      const seatFace=[proj(x,seatH,z+fd*.65),proj(x+fw,seatH,z+fd*.65),proj(x+fw,0,z+fd*.65),proj(x,0,z+fd*.65)]
+      const seatTop=[proj(x,seatH,z+fd*.1),proj(x+fw,seatH,z+fd*.1),proj(x+fw,seatH,z+fd*.65),proj(x,seatH,z+fd*.65)]
+      // Arms
+      const arm1=[proj(x,0,z),proj(x+fw*.09,0,z),proj(x+fw*.09,armH,z+fd*.7),proj(x,armH,z+fd*.7)]
+      const arm2=[proj(x+fw*.91,0,z),proj(x+fw,0,z),proj(x+fw,armH,z+fd*.7),proj(x+fw*.91,armH,z+fd*.7)]
+      // Cushions
+      const cushW=fw/3
+      return <g>
+        {P(back, leftC, darkenHex(fc,.25),.8)}
+        {P(backTop, topC, darkenHex(fc,.18),.7)}
+        {P(seatFace, leftC, darkenHex(fc,.2),.8)}
+        {P(seatTop, topC, darkenHex(fc,.15),.8)}
         {[0,1,2].map(ci=>{
-          const cw=fw/3
-          const cs=[project(x+cw*ci,fh*.45,z+fd*.1),project(x+cw*(ci+1),fh*.45,z+fd*.1),project(x+cw*(ci+1),fh*.45,z+fd*.85),project(x+cw*ci,fh*.45,z+fd*.85)]
-          return<polygon key={ci} points={cs.map(p=>p.join(',')).join(' ')} fill={mx(fc,.06)} stroke={dx(fc,.15)} strokeWidth=".5"/>
+          const cx2=x+cushW*ci+cushW*.05
+          const cushTop=[proj(cx2,seatH+.08,z+fd*.12),proj(cx2+cushW*.9,seatH+.08,z+fd*.12),proj(cx2+cushW*.9,seatH+.08,z+fd*.58),proj(cx2,seatH+.08,z+fd*.58)]
+          return <polygon key={ci} points={cushTop.map(p=>p.join(',')).join(' ')} fill={mixHex(fc,'#ffffff',0.15)} stroke={darkenHex(fc,.15)} strokeWidth=".5"/>
         })}
-      </>}
-      {['dining_table','coffee_table','island','desk'].includes(f.type)&&<>
+        {P(arm1, rightC, darkenHex(fc,.22),.8)}
+        {P(arm2, rightC, darkenHex(fc,.22),.8)}
         {/* Legs */}
-        {[[.08,.08],[.92,.08],[.08,.92],[.92,.92]].map(([lx2,lz2],li)=>{
-          const leg=[project(x+fw*lx2,0,z+fd*lz2),project(x+fw*lx2+.05,0,z+fd*lz2),project(x+fw*lx2+.05,fh*.88,z+fd*lz2),project(x+fw*lx2,fh*.88,z+fd*lz2)]
-          return<polygon key={li} points={leg.map(p=>p.join(',')).join(' ')} fill={dx(fc,.08)} stroke={dx(fc,.2)} strokeWidth=".4"/>
+        {[[.08,.9],[.92,.9],[.08,.2],[.92,.2]].map(([lx,lz],li)=>{
+          const legTop=proj(x+fw*lx,fh*.12,z+fd*lz)
+          const legBot=proj(x+fw*lx,0,z+fd*lz)
+          return <line key={li} x1={legTop[0]} y1={legTop[1]} x2={legBot[0]} y2={legBot[1]} stroke={darkenHex(fc,.3)} strokeWidth="1.5"/>
         })}
-      </>}
-      {['bookshelf','wardrobe','sideboard','cabinets_lower','tv_unit'].includes(f.type)&&<>
-        {/* Shelves */}
-        {Array.from({length:Math.floor(fh/1.2)},(_,si)=>{
-          const sy=(si+1)*fh/Math.ceil(fh/1.2)
-          return<line key={si} x1={project(x,sy,z+fd)[0]} y1={project(x,sy,z+fd)[1]} x2={project(x+fw,sy,z+fd)[0]} y2={project(x+fw,sy,z+fd)[1]} stroke={lx(fc,.08)} strokeWidth=".6"/>
-        })}
-        {f.type==='tv_unit'&&<>
-          {/* TV screen */}
-          {poly([project(x+fw*.1,fh,z+fd*.08),project(x+fw*.9,fh,z+fd*.08),project(x+fw*.9,fh+1.2,z+fd*.08),project(x+fw*.1,fh+1.2,z+fd*.08)],'rgba(15,20,40,0.92)','rgba(40,50,80,0.8)',.8)}
-        </>}
-      </>}
+        {badge}
+      </g>
+    }
 
-      {/* Furniture number badge */}
-      <circle cx={badge[0]} cy={badge[1]} r={8} fill={`hsl(${(num*47)%360},60%,42%)`} stroke="white" strokeWidth="1.2"/>
-      <text x={badge[0]} y={badge[1]+3} textAnchor="middle" fontSize="8" fill="white" fontFamily="Arial,sans-serif" fontWeight="700">{num}</text>
+    // Bed
+    if (f.type==='bed'||f.type==='murphy_bed') {
+      const mattH=fh*.42, baseH=fh*.22
+      // Platform
+      const platFront=[proj(x,baseH,z+fd*.9),proj(x+fw,baseH,z+fd*.9),proj(x+fw,0,z+fd*.9),proj(x,0,z+fd*.9)]
+      const platTop=[proj(x,baseH,z),proj(x+fw,baseH,z),proj(x+fw,baseH,z+fd*.9),proj(x,baseH,z+fd*.9)]
+      // Mattress
+      const mattFront=[proj(x+fw*.03,mattH,z+fd*.88),proj(x+fw*.97,mattH,z+fd*.88),proj(x+fw*.97,baseH,z+fd*.88),proj(x+fw*.03,baseH,z+fd*.88)]
+      const mattTop=[proj(x+fw*.03,mattH,z+fw*.06),proj(x+fw*.97,mattH,z+fw*.06),proj(x+fw*.97,mattH,z+fd*.88),proj(x+fw*.03,mattH,z+fd*.88)]
+      const mattLeft=[proj(x+fw*.03,baseH,z+fw*.06),proj(x+fw*.03,baseH,z+fd*.88),proj(x+fw*.03,mattH,z+fd*.88),proj(x+fw*.03,mattH,z+fw*.06)]
+      // Headboard
+      const hbFront=[proj(x,fh*.7,z+fd*.08),proj(x+fw,fh*.7,z+fd*.08),proj(x+fw,baseH,z+fd*.08),proj(x,baseH,z+fd*.08)]
+      const hbTop=[proj(x,fh,z),proj(x+fw,fh,z),proj(x+fw,fh*.7,z+fd*.08),proj(x,fh*.7,z+fd*.08)]
+      const hbPanel=[proj(x+fw*.06,fh*.92,z+fd*.04),proj(x+fw*.94,fh*.92,z+fd*.04),proj(x+fw*.94,baseH+.3,z+fd*.06),proj(x+fw*.06,baseH+.3,z+fd*.06)]
+      // Pillows
+      const pilC = lightenHex('#F5F5F0', 0.02)
+      // Duvet
+      const duvTop=[proj(x+fw*.04,mattH+.1,z+fd*.2),proj(x+fw*.96,mattH+.1,z+fd*.2),proj(x+fw*.96,mattH+.1,z+fd*.86),proj(x+fw*.04,mattH+.1,z+fd*.86)]
+      return <g>
+        {P(platFront, rightC, darkenHex(fc,.22),.9)}
+        {P(platTop, topC, darkenHex(fc,.15),.9)}
+        {P(hbFront, leftC, darkenHex(fc,.2),.95)}
+        {P(hbTop, topC, darkenHex(fc,.15),.95)}
+        <polygon points={hbPanel.map(p=>p.join(',')).join(' ')} fill="none" stroke={rgba(fc,0.5,0,0.1)} strokeWidth="0.7"/>
+        {P(mattFront, '#F0EDE8', '#D0CCC8',.9)}
+        {P(mattTop, '#F5F2EF', '#D8D4D0',.95)}
+        {P(mattLeft, '#E8E5E0', '#C8C4C0',.9)}
+        {P(duvTop, mixHex('#F0EDE8','#E8E0D4',0.5), darkenHex('#E8E0D4',0.08),.95)}
+        {[.22,.62].map((px2,pi)=>{
+          const pilW=fw*.22, pilD=fd*.16
+          const pil=[proj(x+fw*px2,mattH+.18,z+fd*.12),proj(x+fw*px2+pilW,mattH+.18,z+fd*.12),proj(x+fw*px2+pilW,mattH+.18,z+fd*.12+pilD),proj(x+fw*px2,mattH+.18,z+fd*.12+pilD)]
+          return <polygon key={pi} points={pil.map(p=>p.join(',')).join(' ')} fill={pilC} stroke="#D0CDCA" strokeWidth=".6"/>
+        })}
+        {badge}
+      </g>
+    }
+
+    // Dining / coffee table
+    if (['dining_table','coffee_table','island','side_table'].includes(f.type)) {
+      const legH=fh*.88
+      return <g>
+        {P(right, rightC, darkenHex(fc,.22),.85)}
+        {P(left,  leftC,  darkenHex(fc,.2),.85)}
+        {P(top,   topC,   darkenHex(fc,.15),.9)}
+        {/* Table legs */}
+        {[[.08,.1],[.92,.1],[.08,.9],[.92,.9]].map(([lx,lz],li)=>{
+          const lt=proj(x+fw*lx,legH,z+fd*lz), lb=proj(x+fw*lx,0,z+fd*lz)
+          return<line key={li} x1={lt[0]} y1={lt[1]} x2={lb[0]} y2={lb[1]} stroke={darkenHex(fc,.28)} strokeWidth="1.8"/>
+        })}
+        {badge}
+      </g>
+    }
+
+    // Desk
+    if (f.type==='desk') {
+      return <g>
+        {P(right, rightC, darkenHex(fc,.22),.85)}
+        {P(left,  leftC,  darkenHex(fc,.2),.85)}
+        {P(top,   topC,   darkenHex(fc,.15),.9)}
+        {[.05,.95].map((lx,li)=>{
+          const lt=proj(x+fw*lx,fh*.92,z), lb=proj(x+fw*lx,0,z)
+          const lt2=proj(x+fw*lx,fh*.92,z+fd), lb2=proj(x+fw*lx,0,z+fd)
+          return <g key={li}>
+            <line x1={lt[0]} y1={lt[1]} x2={lb[0]} y2={lb[1]} stroke={darkenHex(fc,.25)} strokeWidth="2"/>
+            <line x1={lt2[0]} y1={lt2[1]} x2={lb2[0]} y2={lb2[1]} stroke={darkenHex(fc,.25)} strokeWidth="2"/>
+          </g>
+        })}
+        {/* Monitor */}
+        {(()=>{
+          const mW=fw*.35, mH=fh*.55
+          const mon=[proj(x+fw*.55,fh,z+fd*.15),proj(x+fw*.55+mW,fh,z+fd*.15),proj(x+fw*.55+mW,fh+mH,z+fd*.15),proj(x+fw*.55,fh+mH,z+fd*.15)]
+          return<>
+            <polygon points={mon.map(p=>p.join(',')).join(' ')} fill="rgba(10,15,30,.92)" stroke="#333" strokeWidth=".7"/>
+            <polygon points={mon.slice(0,4).map((p,i)=>{
+              const sc=0.08; const cx3=mon.reduce((a,b)=>[a[0]+b[0]/4,a[1]+b[1]/4],[0,0] as [number,number])
+              return [cx3[0]+(p[0]-cx3[0])*(1-sc),cx3[1]+(p[1]-cx3[1])*(1-sc)].join(',')
+            }).join(' ')} fill="rgba(20,80,160,.7)" stroke="none"/>
+          </>
+        })()}
+        {badge}
+      </g>
+    }
+
+    // Chair / armchair
+    if (['chair','armchair','dining_chair','stool'].includes(f.type)) {
+      const seatH2=fh*.42
+      const seatFace2=[proj(x,seatH2,z+fd*.8),proj(x+fw,seatH2,z+fd*.8),proj(x+fw,0,z+fd*.8),proj(x,0,z+fd*.8)]
+      const seatTop2=[proj(x,seatH2,z+fd*.1),proj(x+fw,seatH2,z+fd*.1),proj(x+fw,seatH2,z+fd*.8),proj(x,seatH2,z+fd*.8)]
+      const backFace=[proj(x,fh,z+fd*.08),proj(x+fw,fh,z+fd*.08),proj(x+fw,seatH2,z+fd*.08),proj(x,seatH2,z+fd*.08)]
+      return <g>
+        {P(seatFace2, leftC, darkenHex(fc,.2),.85)}
+        {P(seatTop2, topC, darkenHex(fc,.15),.9)}
+        {f.type!=='stool'&&P(backFace, rightC, darkenHex(fc,.2),.85)}
+        {[[.15,.15],[.85,.15],[.15,.85],[.85,.85]].map(([lx,lz],li)=>{
+          const lt=proj(x+fw*lx,seatH2,z+fd*lz), lb=proj(x+fw*lx,0,z+fd*lz)
+          return<line key={li} x1={lt[0]} y1={lt[1]} x2={lb[0]} y2={lb[1]} stroke={darkenHex(fc,.3)} strokeWidth="1.2"/>
+        })}
+        {badge}
+      </g>
+    }
+
+    // Bookshelf / wardrobe / cabinet / sideboard
+    if (['bookshelf','shelving','wardrobe','sideboard','cabinets_lower','tv_unit'].includes(f.type)) {
+      const shCount=Math.max(2,Math.floor(fh/1.1))
+      return <g>
+        {P(right, rightC, darkenHex(fc,.22),.9)}
+        {P(left,  darkenHex(fc,.06), darkenHex(fc,.2),.9)}
+        {P(top,   topC, darkenHex(fc,.15),.9)}
+        {Array.from({length:shCount-1},(_,si)=>{
+          const sy=(si+1)*fh/shCount
+          const sl=[proj(x,sy,z+fd),proj(x+fw,sy,z+fd)]
+          return<line key={si} x1={sl[0][0]} y1={sl[0][1]} x2={sl[1][0]} y2={sl[1][1]} stroke={lightenHex(fc,.08)} strokeWidth="0.6"/>
+        })}
+        {/* Cabinet door handles */}
+        {(()=>{
+          const hm=proj(x+fw*.5,fh*.48,z+fd)
+          return<circle cx={hm[0]} cy={hm[1]} r={2.5} fill={shiny?lightenHex(fc,.3):'#c8b080'} stroke="#a09060" strokeWidth=".5"/>
+        })()}
+        {f.type==='tv_unit'&&(()=>{
+          const tv=[proj(x+fw*.1,fh,z+fd*.1),proj(x+fw*.9,fh,z+fd*.1),proj(x+fw*.9,fh+1.4,z+fd*.1),proj(x+fw*.1,fh+1.4,z+fd*.1)]
+          const scr=[proj(x+fw*.12,fh+.06,z+fd*.08),proj(x+fw*.88,fh+.06,z+fd*.08),proj(x+fw*.88,fh+1.28,z+fd*.08),proj(x+fw*.12,fh+1.28,z+fd*.08)]
+          return<>
+            <polygon points={tv.map(p=>p.join(',')).join(' ')} fill="rgba(8,12,25,.95)" stroke="#222" strokeWidth=".8"/>
+            <polygon points={scr.map(p=>p.join(',')).join(' ')} fill="rgba(15,60,140,.75)" stroke="none"/>
+          </>
+        })()}
+        {badge}
+      </g>
+    }
+
+    // Nightstand / dresser
+    if (['nightstand','dresser','side_table_small'].includes(f.type)) {
+      return <g>
+        {P(right, rightC, darkenHex(fc,.22),.9)}
+        {P(left,  leftC,  darkenHex(fc,.2),.9)}
+        {P(top, shiny?lightenHex(fc,.22):topC, darkenHex(fc,.15),.95)}
+        {/* Lamp on nightstand */}
+        {(()=>{
+          const lbp=proj(x+fw*.7,fh,z+fd*.5)
+          const ltp=proj(x+fw*.7,fh+.9,z+fd*.5)
+          const ls0=proj(x+fw*.55,fh+.9,z+fd*.3), ls1=proj(x+fw*.85,fh+.9,z+fd*.3)
+          const ls2=proj(x+fw*.85,fh+.9+.8,z+fd*.7), ls3=proj(x+fw*.55,fh+.9+.8,z+fd*.7)
+          return<>
+            <line x1={lbp[0]} y1={lbp[1]} x2={ltp[0]} y2={ltp[1]} stroke="#9a8060" strokeWidth="1"/>
+            <polygon points={[ls0,ls1,ls2,ls3].map(p=>p.join(',')).join(' ')} fill="rgba(255,230,150,0.8)" stroke="rgba(200,170,80,0.6)" strokeWidth=".6"/>
+          </>
+        })()}
+        {badge}
+      </g>
+    }
+
+    // Bathtub
+    if (f.type==='bathtub') {
+      const outer=[proj(x,fh,z),proj(x+fw,fh,z),proj(x+fw,fh,z+fd),proj(x,fh,z+fd)]
+      const inner=[proj(x+fw*.08,fh*.72,z+fd*.1),proj(x+fw*.92,fh*.72,z+fd*.1),proj(x+fw*.92,fh*.72,z+fd*.9),proj(x+fw*.08,fh*.72,z+fd*.9)]
+      return <g>
+        {P(right, rightC, darkenHex(fc,.2),.9)}
+        {P(left,  leftC,  darkenHex(fc,.18),.9)}
+        {P(outer, topC, darkenHex(fc,.15),.9)}
+        <polygon points={inner.map(p=>p.join(',')).join(' ')} fill="rgba(200,230,245,0.6)" stroke="#a0c8e0" strokeWidth=".7"/>
+        {badge}
+      </g>
+    }
+
+    // Toilet
+    if (f.type==='toilet') {
+      const tank=[proj(x,fh*.5,z),proj(x+fw,fh*.5,z),proj(x+fw,fh,z),proj(x,fh,z)]
+      const bowl=[proj(x+fw*.08,fh*.3,z+fd*.2),proj(x+fw*.92,fh*.3,z+fd*.2),proj(x+fw*.92,fh*.3,z+fd*.95),proj(x+fw*.08,fh*.3,z+fd*.95)]
+      return <g>
+        {P([proj(x,0,z),proj(x+fw,0,z),proj(x+fw,fh*.5,z),proj(x,fh*.5,z)], leftC, darkenHex(fc,.2),.9)}
+        {P(tank, topC, darkenHex(fc,.15),.9)}
+        {P(bowl, lightenHex(fc,.1), darkenHex(fc,.12),.9)}
+        {badge}
+      </g>
+    }
+
+    // Vanity
+    if (f.type==='vanity') {
+      const mirH=fh*.7
+      const mir=[proj(x,fh*.55,z+fd*.05),proj(x+fw,fh*.55,z+fd*.05),proj(x+fw,fh*.55+mirH,z+fd*.05),proj(x,fh*.55+mirH,z+fd*.05)]
+      return <g>
+        {P(right, rightC, darkenHex(fc,.22),.9)}
+        {P(left,  leftC,  darkenHex(fc,.2),.9)}
+        {P(top,   topC,   darkenHex(fc,.15),.9)}
+        <polygon points={mir.map(p=>p.join(',')).join(' ')} fill="rgba(180,210,225,0.55)" stroke="rgba(160,190,210,0.8)" strokeWidth=".8"/>
+        {badge}
+      </g>
+    }
+
+    // Shower
+    if (f.type==='shower') {
+      const glass=[proj(x,0,z+fd*.9),proj(x+fw,0,z+fd*.9),proj(x+fw,fh,z+fd*.9),proj(x,fh,z+fd*.9)]
+      const glassR=[proj(x+fw*.9,0,z),proj(x+fw*.9,0,z+fd*.9),proj(x+fw*.9,fh,z+fd*.9),proj(x+fw*.9,fh,z)]
+      const base=[proj(x,0,z),proj(x+fw,0,z),proj(x+fw,.12,z+fd),proj(x,.12,z+fd)]
+      return <g>
+        {P(base, lightenHex(fc,.1), darkenHex(fc,.15),.9)}
+        {P(glass, 'rgba(180,220,240,0.22)', 'rgba(150,200,230,0.7)',1)}
+        {P(glassR, 'rgba(180,220,240,0.18)', 'rgba(150,200,230,0.5)',.8)}
+        {badge}
+      </g>
+    }
+
+    // Generic fallback — still looks decent
+    return <g>
+      {P(right, rightC, darkenHex(fc,.22),.88)}
+      {P(left,  leftC,  darkenHex(fc,.2),.88)}
+      {P(top,   topC,   darkenHex(fc,.15),.92)}
+      {badge}
     </g>
   }
 
-  // Sort back-to-front (painter's algorithm) based on current angle
-  const sorted = [...layoutJSON.furniture].sort((a,b)=>{
-    const rad=(angleRef.current*Math.PI)/180
-    const depthA=(a.xFrac+a.wFrac/2)*Math.sin(rad)+(a.yFrac+a.dFrac/2)*Math.cos(rad)
-    const depthB=(b.xFrac+b.wFrac/2)*Math.sin(rad)+(b.yFrac+b.dFrac/2)*Math.cos(rad)
-    return depthA-depthB
+  // Sort back-to-front (painter's algorithm)
+  const sorted = [...layoutJSON.furniture].sort((a,b) => {
+    const rad=degRef.current*Math.PI/180
+    const da=(a.xFrac+a.wFrac/2)*Math.sin(rad)+(a.yFrac+a.dFrac/2)*Math.cos(rad)
+    const db=(b.xFrac+b.wFrac/2)*Math.sin(rad)+(b.yFrac+b.dFrac/2)*Math.cos(rad)
+    return da-db
   })
 
   function captureForPhoto() {
     if(!svgRef.current||!onCapture)return
     const xml=new XMLSerializer().serializeToString(svgRef.current)
-    const b64svg=btoa(unescape(encodeURIComponent(xml)))
-    const img=new Image(); img.width=VW; img.height=VH
+    const img=new Image()
     img.onload=()=>{
       const c=document.createElement('canvas'); c.width=VW; c.height=VH
       const ctx=c.getContext('2d')!
-      ctx.fillStyle=lx(wallC,.12); ctx.fillRect(0,0,VW,VH)
+      ctx.fillStyle=lightenHex(wallC,.12); ctx.fillRect(0,0,VW,VH)
       ctx.drawImage(img,0,0)
       onCapture(c.toDataURL('image/png',1.0).split(',')[1])
     }
-    img.src=`data:image/svg+xml;base64,${b64svg}`
+    img.src=`data:image/svg+xml;base64,${btoa(unescape(encodeURIComponent(xml)))}`
   }
 
-  return (
-    <div style={{ position:'relative' }}>
-      {/* Controls */}
-      <div style={{ position:'absolute', top:8, left:8, zIndex:5, display:'flex', gap:5 }}>
-        <div style={{ background:'rgba(15,23,42,.75)', backdropFilter:'blur(8px)', borderRadius:7, padding:'4px 10px', fontSize:11, fontWeight:700, color:'white', border:'1px solid rgba(255,255,255,.15)' }}>
-          ✦ 3D Room
-        </div>
-        <button onClick={()=>{ spinRef.current=!spinning; setSpinning(s=>!s) }}
-          style={{ background: spinning?'rgba(79,124,255,.85)':'rgba(15,23,42,.75)', backdropFilter:'blur(8px)', borderRadius:7, padding:'4px 10px', fontSize:11, fontWeight:700, color:'white', border:`1px solid ${spinning?'rgba(79,124,255,.5)':'rgba(255,255,255,.15)'}`, cursor:'pointer', fontFamily:'inherit' }}>
-          {spinning ? '⏸ Pause' : '▶ Rotate'}
-        </button>
-      </div>
-      {onCapture && (
-        <button onClick={captureForPhoto}
-          style={{ position:'absolute', bottom:8, right:120, zIndex:5, background:'rgba(245,158,11,.9)', borderRadius:7, padding:'5px 12px', fontSize:11, fontWeight:700, color:'white', border:'none', cursor:'pointer', fontFamily:'inherit' }}>
-          📸 Make Photo from This View
-        </button>
-      )}
-      <button onClick={()=>{
-        const xml=new XMLSerializer().serializeToString(svgRef.current!)
-        const a=document.createElement('a'); a.href='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(xml); a.download='3d-view.svg'; a.click()
-      }} style={{ position:'absolute', bottom:8, right:8, zIndex:5, background:'rgba(79,124,255,.85)', borderRadius:7, padding:'5px 12px', fontSize:11, fontWeight:700, color:'white', border:'none', cursor:'pointer', fontFamily:'inherit' }}>⬇ Save</button>
+  const bgGrad = `linear-gradient(145deg, ${lightenHex(wallC,.16)} 0%, ${lightenHex(wallC,.06)} 100%)`
 
-      {/* 3D SVG */}
-      <svg ref={svgRef} viewBox={`0 0 ${VW} ${VH}`} width="100%" height="400" xmlns="http://www.w3.org/2000/svg"
-        style={{ display:'block', borderRadius:12, background:`linear-gradient(160deg,${lx(wallC,.18)},${lx(wallC,.08)})` }}>
-        {shell()}
-        {sorted.map((f,i) => renderPiece(f, layoutJSON.furniture.findIndex(fi=>fi.id===f.id)))}
-      </svg>
+  return (
+    <div style={{ borderRadius:16, overflow:'hidden', border:`1px solid ${darkenHex(wallC,.06)}` }}>
+      {/* Header bar */}
+      <div style={{ background:bgGrad, padding:'8px 12px', display:'flex', alignItems:'center', justifyContent:'space-between', borderBottom:`1px solid ${darkenHex(wallC,.08)}` }}>
+        <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+          <span style={{ background:'linear-gradient(135deg,#4f7cff,#7c3aed)', color:'white', borderRadius:7, padding:'3px 9px', fontSize:11, fontWeight:800 }}>3D Room</span>
+          <span style={{ fontSize:11, color:darkenHex(wallC,.4), fontFamily:'inherit' }}>Linked · {W}′ × {L}′ · {H}ft ceiling</span>
+        </div>
+        <div style={{ display:'flex', gap:6 }}>
+          <button onClick={()=>{ pausedRef.current=!paused; setPaused(p=>!p) }}
+            style={{ background: paused?'rgba(79,124,255,.15)':'rgba(79,124,255,.9)', border:`1px solid ${paused?'rgba(79,124,255,.4)':'rgba(79,124,255,.6)'}`, borderRadius:7, padding:'4px 11px', fontSize:11, fontWeight:700, color:paused?'#4f7cff':'white', cursor:'pointer', fontFamily:'inherit' }}>
+            {paused ? '▶ Rotate' : '⏸ Pause'}
+          </button>
+          {onCapture && (
+            <button onClick={captureForPhoto}
+              style={{ background:'rgba(245,158,11,.88)', border:'none', borderRadius:7, padding:'4px 11px', fontSize:11, fontWeight:700, color:'white', cursor:'pointer', fontFamily:'inherit' }}>
+              📸 Photo
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* SVG viewport */}
+      <div style={{ position:'relative', background:bgGrad }}>
+        <svg ref={svgRef} viewBox={`0 0 ${VW} ${VH}`} width="100%" height="430"
+          xmlns="http://www.w3.org/2000/svg" style={{ display:'block' }}>
+          <defs>
+            <radialGradient id="floorLight" cx="50%" cy="40%" r="60%">
+              <stop offset="0%" stopColor="rgba(255,255,240,0.12)"/>
+              <stop offset="100%" stopColor="rgba(0,0,0,0)"/>
+            </radialGradient>
+          </defs>
+          <Shell/>
+          {sorted.map((f,i)=>(
+            <FurniturePiece key={f.id} f={f} idx={layoutJSON.furniture.findIndex(fi=>fi.id===f.id)}/>
+          ))}
+          {/* Ambient floor glow */}
+          <ellipse cx={VW/2} cy={VH*.68} rx={VW*.4} ry={VH*.15} fill="url(#floorLight)"/>
+        </svg>
+      </div>
 
       {/* Furniture legend */}
-      <div style={{ marginTop:10, background:'rgba(255,255,255,.96)', border:'1px solid #e8eaf0', borderRadius:10, padding:'10px 14px' }}>
-        <div style={{ fontSize:11, fontWeight:700, color:'#64748b', textTransform:'uppercase', letterSpacing:'.8px', marginBottom:8 }}>Furniture Legend</div>
-        <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill, minmax(160px,1fr))', gap:'4px 16px' }}>
+      <div style={{ background:'white', borderTop:`1px solid ${darkenHex(wallC,.06)}`, padding:'10px 16px' }}>
+        <div style={{ fontSize:10, fontWeight:800, color:'#94a3b8', textTransform:'uppercase', letterSpacing:'.9px', marginBottom:8 }}>Furniture Legend</div>
+        <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(150px,1fr))', gap:'5px 12px' }}>
           {layoutJSON.furniture.map((f,i)=>(
             <div key={f.id} style={{ display:'flex', alignItems:'center', gap:6, fontSize:11 }}>
-              <span style={{ width:16, height:16, borderRadius:4, background:`hsl(${(i+1)*47%360},60%,42%)`, color:'white', display:'flex', alignItems:'center', justifyContent:'center', fontSize:8, fontWeight:800, flexShrink:0 }}>{i+1}</span>
-              <span style={{ width:10, height:10, borderRadius:2, background:f.color, border:'1px solid rgba(0,0,0,.1)', flexShrink:0 }}/>
-              <span style={{ color:'#374151', lineHeight:1.4 }}>{f.label}</span>
+              <span style={{ width:16, height:16, borderRadius:4, background:badgeColor(i), color:'white', display:'flex', alignItems:'center', justifyContent:'center', fontSize:8, fontWeight:800, flexShrink:0 }}>{i+1}</span>
+              <span style={{ width:10, height:10, borderRadius:2, background:f.color||'#888', border:'1px solid rgba(0,0,0,.1)', flexShrink:0 }}/>
+              <span style={{ color:'#374151', lineHeight:1.3 }}>{f.label}</span>
             </div>
           ))}
         </div>
@@ -321,139 +688,227 @@ function RoomViewer3D({ layoutJSON, style, roomType, onCapture }: {
 }
 
 // ─── 2D FLOOR PLAN ────────────────────────────────────────────────────────────
-function FloorPlan2D({ layoutJSON, style: styleProp, roomType: roomTypeProp }: { layoutJSON: LayoutJSON; style?: string; roomType?: string }) {
-  const PW=680, PH=500
-  const { widthFt: W, lengthFt: L } = layoutJSON.dimensions
-  const MARGIN=60
-  const rw=PW-MARGIN*2, rh=PH-MARGIN*2
-  const scX=rw/W, scY=rh/L
-  const ox=MARGIN, oy=MARGIN
+function FloorPlan2D({ layoutJSON, style: styleProp, roomType: roomTypeProp }: {
+  layoutJSON: LayoutJSON; style?: string; roomType?: string
+}) {
+  const MAIN_W=640, MAIN_H=520
+  const LEGEND_W=160
+  const TOTAL_W=MAIN_W+LEGEND_W
+  const MARGIN_T=50, MARGIN_L=52, MARGIN_B=44, MARGIN_R=28
+  const rW=MAIN_W-MARGIN_L-MARGIN_R, rH=MAIN_H-MARGIN_T-MARGIN_B
+  const ox=MARGIN_L, oy=MARGIN_T
+  const { widthFt:W, lengthFt:L } = layoutJSON.dimensions
+  const scX=rW/W, scY=rH/L
   const wallC=layoutJSON.walls.color||'#F0EDE8'
   const floorC=layoutJSON.floor.color||'#C4A882'
+  const floorMat=layoutJSON.floor.material||'hardwood'
 
-  function lx2(hex:string,a=.55):string{const[r,g,b]=hx(hex);const f=(v:number)=>Math.round(Math.min((v+a)*255,255));return`#${f(r).toString(16).padStart(2,'0')}${f(g).toString(16).padStart(2,'0')}${f(b).toString(16).padStart(2,'0')}`}
-  function dx2(hex:string,a=.3):string{const[r,g,b]=hx(hex);const f=(v:number)=>Math.round(Math.max((v-a)*255,0));return`#${f(r).toString(16).padStart(2,'0')}${f(g).toString(16).padStart(2,'0')}${f(b).toString(16).padStart(2,'0')}`}
+  // Lighten/darken hex for SVG fills
+  function lh(hex: string, a=.5): string {
+    const[r,g,b]=parseHex(hex); const f=(v:number)=>Math.round(Math.min(v+a*255,255))
+    return`#${f(r).toString(16).padStart(2,'0')}${f(g).toString(16).padStart(2,'0')}${f(b).toString(16).padStart(2,'0')}`
+  }
+  function dh(hex: string, a=.25): string {
+    const[r,g,b]=parseHex(hex); const f=(v:number)=>Math.round(Math.max(v-a*255,0))
+    return`#${f(r).toString(16).padStart(2,'0')}${f(g).toString(16).padStart(2,'0')}${f(b).toString(16).padStart(2,'0')}`
+  }
+
+  // Pixel coords from room coords
+  const px = (x: number) => ox + x * scX
+  const py = (z: number) => oy + z * scY
+
+  // Floor pattern
+  const floorPattern: JSX.Element[] = []
+  if (floorMat==='hardwood'||floorMat==='wood') {
+    for (let i=0;i<W*2;i++) {
+      const x=i*0.5
+      if(x>W) break
+      floorPattern.push(<line key={`h${i}`} x1={px(x)} y1={oy} x2={px(x)} y2={oy+rH} stroke={dh(floorC,.06)} strokeWidth=".5" opacity=".4"/>)
+    }
+  } else if (floorMat==='tile'||floorMat==='marble') {
+    for(let i=0;i<=W;i+=2) floorPattern.push(<line key={`ti${i}`} x1={px(i)} y1={oy} x2={px(i)} y2={oy+rH} stroke={dh(floorC,.1)} strokeWidth=".7" opacity=".4"/>)
+    for(let j=0;j<=L;j+=2) floorPattern.push(<line key={`tj${j}`} x1={ox} y1={py(j)} x2={ox+rW} y2={py(j)} stroke={dh(floorC,.1)} strokeWidth=".7" opacity=".4"/>)
+  }
+
+  // Tick marks
+  const hTicks=Array.from({length:Math.floor(W/2)+1},(_,i)=>{
+    const x=px(i*2)
+    return<g key={i}><line x1={x} y1={oy-8} x2={x} y2={oy-3} stroke="#888" strokeWidth="1"/><text x={x} y={oy-12} textAnchor="middle" fontSize="9" fill="#888" fontFamily="Arial,sans-serif">{i*2}'</text></g>
+  })
+  const vTicks=Array.from({length:Math.floor(L/2)+1},(_,i)=>{
+    const y=py(i*2)
+    return<g key={i}><line x1={ox-8} y1={y} x2={ox-3} y2={y} stroke="#888" strokeWidth="1"/><text x={ox-11} y={y} textAnchor="end" dominantBaseline="middle" fontSize="9" fill="#888" fontFamily="Arial,sans-serif">{i*2}'</text></g>
+  })
+
+  // Door swing (bottom-right corner)
+  const dX=px(W)-scX*2.5, dY=py(L), dR=scX*2.5
 
   function renderFP(f: LayoutJSON['furniture'][0], idx: number) {
-    const px=ox+f.xFrac*rw, py=oy+f.yFrac*rh
-    const pw=f.wFrac*rw, ph2=f.dFrac*rh
-    if(pw<4||ph2<4)return null
-    const cx2=px+pw/2, cy=py+ph2/2
-    const num=idx+1
-    const fs=Math.max(8,Math.min(12,pw/6))
-    const lbl=f.label.length>14?f.label.slice(0,13)+'…':f.label
+    const fpx=px(f.xFrac*W), fpy=py(f.yFrac*L)
+    const fpw=f.wFrac*W*scX, fph=f.dFrac*L*scY
+    if(fpw<3||fph<3) return null
+    const cx2=fpx+fpw/2, cy2=fpy+fph/2
+    const bc=badgeColor(idx)
+    const fs=Math.max(7.5,Math.min(11,fpw/7))
+    const lbl=f.label.length>16?f.label.slice(0,15)+'…':f.label.toUpperCase()
+    const fc2=f.color||'#8B8680'
+
+    // Badge helper
+    const badge2=(bx: number,by: number)=>(
+      <g>
+        <circle cx={bx} cy={by} r={7.5} fill={bc} stroke="white" strokeWidth="1.2"/>
+        <text x={bx} y={by+3} textAnchor="middle" fontSize="8" fill="white" fontFamily="Arial,sans-serif" fontWeight="800">{idx+1}</text>
+      </g>
+    )
 
     if(f.type==='rug'){
       return<g key={f.id}>
-        <rect x={px} y={py} width={pw} height={ph2} fill={f.color+'44'} stroke={f.color} strokeWidth="1" strokeDasharray="5,3" rx="2"/>
+        <rect x={fpx} y={fpy} width={fpw} height={fph} fill={rgba(fc2,0.55)} stroke={fc2} strokeWidth="1" strokeDasharray="4,3" rx="3"/>
+        <rect x={fpx+4} y={fpy+4} width={fpw-8} height={fph-8} fill="none" stroke={dh(fc2,.1)} strokeWidth=".5" rx="2"/>
+      </g>
+    }
+    if(f.type==='plant'||f.type==='floor_plant'){
+      return<g key={f.id}>
+        <circle cx={cx2} cy={cy2} r={Math.min(fpw,fph)/2} fill="rgba(60,140,60,0.7)" stroke="#2d6a2d" strokeWidth="1"/>
+        {[0,72,144,216,288].map((a3,i)=>{
+          const lx2=cx2+Math.cos(a3*Math.PI/180)*fpw*.38
+          const ly=cy2+Math.sin(a3*Math.PI/180)*fph*.38
+          return<ellipse key={i} cx={(cx2+lx2)/2} cy={(cy2+ly)/2} rx={fpw*.14} ry={fpw*.07} fill="rgba(50,130,50,0.8)" transform={`rotate(${a3},${(cx2+lx2)/2},${(cy2+ly)/2})`}/>
+        })}
+        {badge2(fpx+fpw-8,fpy+8)}
+      </g>
+    }
+    if(f.type==='chandelier'){
+      return<g key={f.id}>
+        <circle cx={cx2} cy={cy2} r={Math.min(fpw,fph)/2} fill="rgba(220,180,80,0.3)" stroke="#c0a040" strokeWidth="1.5" strokeDasharray="3,2"/>
+        <circle cx={cx2} cy={cy2} r={Math.min(fpw,fph)*.18} fill="rgba(220,180,80,0.8)" stroke="#a07820" strokeWidth="1"/>
+        {badge2(fpx+fpw-8,fpy+8)}
       </g>
     }
     if(f.type==='bathtub'){
       return<g key={f.id}>
-        <ellipse cx={cx2} cy={cy} rx={pw/2} ry={ph2/2} fill={lx2(f.color,.5)} stroke={dx2(f.color,.2)} strokeWidth="1.5"/>
-        <ellipse cx={cx2} cy={cy+ph2*.12} rx={pw*.42} ry={ph2*.38} fill="none" stroke={dx2(f.color,.1)} strokeWidth=".8"/>
-        <circle cx={cx2} cy={py+ph2*.12} r={pw*.08} fill={dx2(f.color,.2)}/>
-        <text x={cx2} y={cy+4} textAnchor="middle" fontSize={fs-1} fill={dx2(f.color,.4)} fontFamily="Arial,sans-serif">{lbl}</text>
-        <circle cx={px+pw-8} cy={py+8} r={7} fill={`hsl(${num*47%360},60%,42%)`} stroke="white" strokeWidth="1"/>
-        <text x={px+pw-8} y={py+12} textAnchor="middle" fontSize="7" fill="white" fontFamily="Arial,sans-serif" fontWeight="700">{num}</text>
+        <ellipse cx={cx2} cy={cy2} rx={fpw/2} ry={fph/2} fill={lh(fc2,.55)} stroke={dh(fc2,.18)} strokeWidth="1.5"/>
+        <ellipse cx={cx2} cy={cy2+fph*.1} rx={fpw*.42} ry={fph*.36} fill="rgba(200,230,245,0.6)" stroke={dh(fc2,.1)} strokeWidth=".7"/>
+        <circle cx={cx2} cy={fpy+fph*.12} r={fpw*.07} fill={dh(fc2,.15)}/>
+        <text x={cx2} y={cy2+3} textAnchor="middle" fontSize={fs-1} fill={dh(fc2,.45)} fontFamily="Arial,sans-serif" fontWeight="700">{lbl}</text>
+        {badge2(fpx+fpw-9,fpy+9)}
       </g>
     }
     if(f.type==='toilet'){
       return<g key={f.id}>
-        <rect x={px} y={py} width={pw} height={ph2*.32} fill={lx2(f.color,.5)} stroke={dx2(f.color,.2)} strokeWidth="1.2" rx="2"/>
-        <ellipse cx={cx2} cy={py+ph2*.68} rx={pw*.44} ry={ph2*.3} fill={lx2(f.color,.55)} stroke={dx2(f.color,.2)} strokeWidth="1.2"/>
-        <circle cx={px+pw-7} cy={py+7} r={6} fill={`hsl(${num*47%360},60%,42%)`} stroke="white" strokeWidth="1"/>
-        <text x={px+pw-7} y={py+11} textAnchor="middle" fontSize="7" fill="white" fontFamily="Arial,sans-serif" fontWeight="700">{num}</text>
+        <rect x={fpx} y={fpy} width={fpw} height={fph*.3} fill={lh(fc2,.55)} stroke={dh(fc2,.18)} strokeWidth="1.2" rx="2"/>
+        <ellipse cx={cx2} cy={fpy+fph*.68} rx={fpw*.44} ry={fph*.3} fill={lh(fc2,.58)} stroke={dh(fc2,.18)} strokeWidth="1.2"/>
+        {badge2(fpx+fpw-8,fpy+8)}
+      </g>
+    }
+    if(f.type==='shower'){
+      return<g key={f.id}>
+        <rect x={fpx} y={fpy} width={fpw} height={fph} fill="rgba(190,225,240,0.3)" stroke="rgba(140,195,220,0.9)" strokeWidth="1.5" rx="2"/>
+        <line x1={fpx} y1={fpy} x2={fpx+fpw} y2={fpy+fph} stroke="rgba(140,195,220,0.4)" strokeWidth=".6"/>
+        <line x1={fpx+fpw} y1={fpy} x2={fpx} y2={fpy+fph} stroke="rgba(140,195,220,0.4)" strokeWidth=".6"/>
+        <circle cx={fpx+fpw*.2} cy={fpy+fph*.2} r={fpw*.1} fill="rgba(100,170,200,0.6)" stroke="rgba(80,150,190,0.8)" strokeWidth=".8"/>
+        {badge2(fpx+fpw-9,fpy+9)}
       </g>
     }
     if(f.type==='bed'||f.type==='murphy_bed'){
       return<g key={f.id}>
-        <rect x={px} y={py} width={pw} height={ph2} fill={lx2(f.color,.5)} stroke={dx2(f.color,.2)} strokeWidth="1.5" rx="3"/>
-        <rect x={px} y={py} width={pw} height={ph2*.2} fill={dx2(f.color,.08)} stroke={dx2(f.color,.2)} strokeWidth=".8" rx="2"/>
-        {[.22,.62].map((pxf,pi)=><ellipse key={pi} cx={px+pw*pxf} cy={py+ph2*.15} rx={pw*.14} ry={ph2*.08} fill={lx2(f.color,.3)} stroke={dx2(f.color,.1)} strokeWidth=".6"/>)}
-        {pw>30&&ph2>20&&<text x={cx2} y={cy+4} textAnchor="middle" fontSize={fs} fill={dx2(f.color,.5)} fontFamily="Arial,sans-serif" fontWeight="600">{lbl}</text>}
-        <circle cx={px+pw-8} cy={py+8} r={7} fill={`hsl(${num*47%360},60%,42%)`} stroke="white" strokeWidth="1"/>
-        <text x={px+pw-8} y={py+12} textAnchor="middle" fontSize="7" fill="white" fontFamily="Arial,sans-serif" fontWeight="700">{num}</text>
+        <rect x={fpx} y={fpy} width={fpw} height={fph} fill={lh(fc2,.52)} stroke={dh(fc2,.2)} strokeWidth="1.5" rx="3"/>
+        <rect x={fpx} y={fpy} width={fpw} height={fph*.18} fill={dh(fc2,.06)} stroke="none" rx="2"/>
+        {[.2,.62].map((ppx,pi)=><ellipse key={pi} cx={fpx+fpw*ppx} cy={fpy+fph*.12} rx={fpw*.14} ry={fph*.07} fill={lh(fc2,.3)} stroke={dh(fc2,.1)} strokeWidth=".7"/>)}
+        <rect x={fpx+fpw*.04} y={fpy+fph*.22} width={fpw*.92} height={fph*.72} fill={lh(fc2,.62)} stroke="none" rx="2"/>
+        {fpw>35&&fph>22&&<text x={cx2} y={cy2+4} textAnchor="middle" fontSize={fs} fill={dh(fc2,.5)} fontFamily="Arial,sans-serif" fontWeight="700">{lbl}</text>}
+        {badge2(fpx+fpw-9,fpy+9)}
       </g>
     }
     if(f.type==='sofa'||f.type==='chaise'){
       return<g key={f.id}>
-        <rect x={px} y={py} width={pw} height={ph2} fill={lx2(f.color,.5)} stroke={dx2(f.color,.22)} strokeWidth="1.5" rx="3"/>
-        <rect x={px} y={py} width={pw} height={ph2*.26} fill={dx2(f.color,.08)} stroke="none" rx="2"/>
-        {[0,1,2].map(ci=><rect key={ci} x={px+pw/3*ci+pw*.015} y={py+ph2*.28} width={pw/3-pw*.03} height={ph2*.62} fill={lx2(f.color,.06)} stroke={dx2(f.color,.1)} strokeWidth=".5" rx="2"/>)}
-        {pw>30&&ph2>20&&<text x={cx2} y={cy+4} textAnchor="middle" fontSize={fs} fill={dx2(f.color,.5)} fontFamily="Arial,sans-serif">{lbl}</text>}
-        <circle cx={px+pw-8} cy={py+8} r={7} fill={`hsl(${num*47%360},60%,42%)`} stroke="white" strokeWidth="1"/>
-        <text x={px+pw-8} y={py+12} textAnchor="middle" fontSize="7" fill="white" fontFamily="Arial,sans-serif" fontWeight="700">{num}</text>
+        <rect x={fpx} y={fpy} width={fpw} height={fph} fill={lh(fc2,.5)} stroke={dh(fc2,.2)} strokeWidth="1.5" rx="4"/>
+        <rect x={fpx} y={fpy} width={fpw} height={fph*.24} fill={dh(fc2,.06)} stroke="none" rx="3"/>
+        {[0,1,2].map(ci=><rect key={ci} x={fpx+fpw/3*ci+2} y={fpy+fph*.26} width={fpw/3-4} height={fph*.65} fill={lh(fc2,.08)} stroke={dh(fc2,.1)} strokeWidth=".5" rx="3"/>)}
+        {fpw>35&&fph>20&&<text x={cx2} y={cy2+4} textAnchor="middle" fontSize={fs} fill={dh(fc2,.5)} fontFamily="Arial,sans-serif">{lbl}</text>}
+        {badge2(fpx+fpw-9,fpy+9)}
       </g>
     }
-    // Default box
+    // Default labelled box
     return<g key={f.id}>
-      <rect x={px} y={py} width={pw} height={ph2} fill={lx2(f.color,.52)} stroke={dx2(f.color,.22)} strokeWidth="1.5" rx="2"/>
-      {pw>28&&ph2>16&&<text x={cx2} y={cy+4} textAnchor="middle" fontSize={fs} fill={dx2(f.color,.5)} fontFamily="Arial,sans-serif" fontWeight="500">{lbl}</text>}
-      <circle cx={px+pw-8} cy={py+8} r={7} fill={`hsl(${num*47%360},60%,42%)`} stroke="white" strokeWidth="1"/>
-      <text x={px+pw-8} y={py+12} textAnchor="middle" fontSize="7" fill="white" fontFamily="Arial,sans-serif" fontWeight="700">{num}</text>
+      <rect x={fpx} y={fpy} width={fpw} height={fph} fill={lh(fc2,.52)} stroke={dh(fc2,.2)} strokeWidth="1.5" rx="2"/>
+      {fpw>24&&fph>14&&<text x={cx2} y={cy2+4} textAnchor="middle" fontSize={fs} fill={dh(fc2,.5)} fontFamily="Arial,sans-serif" fontWeight="600">{lbl}</text>}
+      {badge2(fpx+fpw-9,fpy+9)}
     </g>
   }
 
-  // Door swing
-  const doorX=ox+rw-scX*3, doorY=oy+rh, doorR=scX*3
-  // Tick marks every 2ft
-  const hTicks=Array.from({length:Math.floor(W/2)+1},(_,i)=>{
-    const x=ox+i*2*scX
-    return<g key={i}><line x1={x} y1={oy-8} x2={x} y2={oy-3} stroke="#888" strokeWidth="1"/><text x={x} y={oy-11} textAnchor="middle" fontSize="9" fill="#888" fontFamily="Arial,sans-serif">{i*2}'</text></g>
-  })
-  const vTicks=Array.from({length:Math.floor(L/2)+1},(_,i)=>{
-    const y=oy+i*2*scY
-    return<g key={i}><line x1={ox-8} y1={y} x2={ox-3} y2={y} stroke="#888" strokeWidth="1"/><text x={ox-11} y={y} textAnchor="end" dominantBaseline="middle" fontSize="9" fill="#888" fontFamily="Arial,sans-serif">{i*2}'</text></g>
-  })
-
-  return(
-    <div>
-      <svg viewBox={`0 0 ${PW} ${PH}`} width="100%" xmlns="http://www.w3.org/2000/svg" style={{display:'block',borderRadius:12,border:'1px solid #e8eaf0'}}>
-        <rect width={PW} height={PH} fill="#FAFAF8"/>
-        <text x={PW/2} y={oy-22} textAnchor="middle" fontSize="13" fontWeight="700" fill="#1a1a2e" fontFamily="Arial,sans-serif">
-          {styleProp||''} {roomTypeProp||''} · {W}′ × {L}′ · {layoutJSON.dimensions.sqft} sq ft
-        </text>
-        {hTicks}{vTicks}
-        {/* Floor */}
-        <rect x={ox} y={oy} width={rw} height={rh} fill={lx2(floorC,.72)} stroke="none"/>
-        {/* Floor lines */}
-        {(layoutJSON.floor.material==='hardwood'||layoutJSON.floor.material==='wood')&&
-          Array.from({length:Math.floor(W*2)},(_,i)=>{
-            const x=ox+i*scX*.5
-            return x<=ox+rw?<line key={i} x1={x} y1={oy} x2={x} y2={oy+rh} stroke={dx2(floorC,.08)} strokeWidth=".4" opacity=".4"/>:null
-          })
-        }
-        {/* Walls */}
-        <rect x={ox} y={oy} width={rw} height={rh} fill="none" stroke="#1a1a2e" strokeWidth="5" rx="1"/>
-        {/* Door swing */}
-        <line x1={doorX} y1={doorY} x2={doorX+doorR} y2={doorY} stroke="#444" strokeWidth="2.5"/>
-        <path d={`M${doorX} ${doorY} A${doorR} ${doorR} 0 0 1 ${doorX} ${doorY-doorR}`} fill="none" stroke="#666" strokeWidth="1" strokeDasharray="4,2"/>
-        {/* Furniture */}
-        {layoutJSON.furniture.map((f,i)=>renderFP(f,i))}
-        {/* Dimension arrows */}
-        <defs><marker id="arr2d" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto"><path d="M0,0 L0,6 L6,3 z" fill="#555"/></marker></defs>
-        <line x1={ox} y1={oy+rh+22} x2={ox+rw} y2={oy+rh+22} stroke="#555" strokeWidth="1" markerStart="url(#arr2d)" markerEnd="url(#arr2d)"/>
-        <text x={ox+rw/2} y={oy+rh+36} textAnchor="middle" fontSize="11" fill="#555" fontFamily="Arial,sans-serif">{W} ft</text>
-        <line x1={ox+rw+22} y1={oy} x2={ox+rw+22} y2={oy+rh} stroke="#555" strokeWidth="1" markerStart="url(#arr2d)" markerEnd="url(#arr2d)"/>
-        <text x={ox+rw+36} y={oy+rh/2} textAnchor="middle" fontSize="11" fill="#555" fontFamily="Arial,sans-serif" transform={`rotate(-90,${ox+rw+36},${oy+rh/2})`}>{L} ft</text>
-      </svg>
-      {/* Legend */}
-      <div style={{marginTop:10,background:'white',border:'1px solid #e8eaf0',borderRadius:10,padding:'10px 14px'}}>
-        <div style={{fontSize:11,fontWeight:700,color:'#64748b',textTransform:'uppercase',letterSpacing:'.8px',marginBottom:8}}>Floor Plan Legend</div>
-        <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(180px,1fr))',gap:'4px 16px'}}>
-          {layoutJSON.furniture.map((f,i)=>(
-            <div key={f.id} style={{display:'flex',alignItems:'center',gap:6,fontSize:11}}>
-              <span style={{width:16,height:16,borderRadius:3,background:`hsl(${(i+1)*47%360},60%,42%)`,color:'white',display:'flex',alignItems:'center',justifyContent:'center',fontSize:8,fontWeight:800,flexShrink:0}}>{i+1}</span>
-              <span style={{width:12,height:12,borderRadius:2,background:lx2(f.color,.5),border:`1.5px solid ${dx2(f.color,.2)}`,flexShrink:0}}/>
-              <span style={{color:'#374151',lineHeight:1.4}}>{f.label}</span>
-            </div>
-          ))}
+  return (
+    <div style={{ borderRadius:16, overflow:'hidden', border:'1px solid #e8eaf0' }}>
+      {/* Header */}
+      <div style={{ background:`linear-gradient(135deg,${lh(wallC,.1)},${lh(wallC,.06)})`, padding:'8px 16px', display:'flex', alignItems:'center', justifyContent:'space-between', borderBottom:'1px solid #e8eaf0' }}>
+        <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+          <span style={{ background:'linear-gradient(135deg,#10b981,#059669)', color:'white', borderRadius:7, padding:'3px 9px', fontSize:11, fontWeight:800 }}>Floor Plan</span>
+          <span style={{ fontSize:11, color:'#64748b', fontFamily:'inherit' }}>Linked · Top View</span>
+        </div>
+        <div style={{ display:'flex', alignItems:'center', gap:5, background:'#f0fdf4', border:'1px solid #bbf7d0', borderRadius:20, padding:'3px 10px', fontSize:10, fontWeight:700, color:'#16a34a' }}>
+          📐 Top View
         </div>
       </div>
+
+      {/* SVG with side legend */}
+      <svg viewBox={`0 0 ${TOTAL_W} ${MAIN_H}`} width="100%" xmlns="http://www.w3.org/2000/svg"
+        style={{ display:'block', background:'#FAFAF8' }}>
+        {/* Title */}
+        <text x={MAIN_W/2} y={30} textAnchor="middle" fontSize="13" fontWeight="700" fill="#1a1a2e" fontFamily="Arial,sans-serif">
+          {styleProp} {roomTypeProp} · {W}′ × {L}′ · {layoutJSON.dimensions.sqft} sq ft
+        </text>
+
+        {/* Ticks */}
+        {hTicks}{vTicks}
+
+        {/* Floor */}
+        <rect x={ox} y={oy} width={rW} height={rH} fill={lh(floorC,.72)} stroke="none"/>
+        {floorPattern}
+
+        {/* Walls */}
+        <rect x={ox} y={oy} width={rW} height={rH} fill="none" stroke="#1a1a2e" strokeWidth="5" rx="1"/>
+
+        {/* Inner wall line (thickness effect) */}
+        <rect x={ox+4} y={oy+4} width={rW-8} height={rH-8} fill="none" stroke={lh(wallC,.2)} strokeWidth="1" opacity="0.5"/>
+
+        {/* Door swing */}
+        <line x1={dX} y1={dY} x2={dX+dR} y2={dY} stroke="#444" strokeWidth="2.5" strokeLinecap="round"/>
+        <path d={`M${dX} ${dY} A${dR} ${dR} 0 0 1 ${dX} ${dY-dR}`} fill="none" stroke="#666" strokeWidth="1" strokeDasharray="4,2"/>
+
+        {/* Window on top wall */}
+        <rect x={px(W*.3)} y={oy-1} width={px(W*.7)-px(W*.3)} height={5} fill="rgba(180,220,255,0.7)" stroke="rgba(100,160,220,0.8)" strokeWidth="1"/>
+
+        {/* Furniture */}
+        {layoutJSON.furniture.map((f,i)=>renderFP(f,i))}
+
+        {/* Dimension arrows */}
+        <defs><marker id="ar2" markerWidth="7" markerHeight="7" refX="3.5" refY="3.5" orient="auto"><path d="M0,0 L0,7 L7,3.5 z" fill="#555"/></marker></defs>
+        <line x1={ox} y1={oy+rH+26} x2={ox+rW} y2={oy+rH+26} stroke="#555" strokeWidth="1.2" markerStart="url(#ar2)" markerEnd="url(#ar2)"/>
+        <text x={ox+rW/2} y={oy+rH+40} textAnchor="middle" fontSize="11" fill="#555" fontFamily="Arial,sans-serif" fontWeight="600">{W} ft</text>
+        <line x1={ox+rW+24} y1={oy} x2={ox+rW+24} y2={oy+rH} stroke="#555" strokeWidth="1.2" markerStart="url(#ar2)" markerEnd="url(#ar2)"/>
+        <text x={ox+rW+38} y={oy+rH/2} textAnchor="middle" fontSize="11" fill="#555" fontFamily="Arial,sans-serif" fontWeight="600" transform={`rotate(-90,${ox+rW+38},${oy+rH/2})`}>{L} ft</text>
+
+        {/* ── SIDE LEGEND ── */}
+        <rect x={MAIN_W} y={0} width={LEGEND_W} height={MAIN_H} fill="#f8fafc"/>
+        <line x1={MAIN_W} y1={0} x2={MAIN_W} y2={MAIN_H} stroke="#e2e8f0" strokeWidth="1"/>
+        <text x={MAIN_W+12} y={24} fontSize="10" fontWeight="800" fill="#64748b" fontFamily="Arial,sans-serif" letterSpacing="0.8">FLOOR PLAN</text>
+        <text x={MAIN_W+12} y={36} fontSize="10" fontWeight="800" fill="#64748b" fontFamily="Arial,sans-serif" letterSpacing="0.8">LEGEND</text>
+        {layoutJSON.furniture.map((f,i)=>{
+          const ly=52+i*20
+          if(ly>MAIN_H-10) return null
+          const bc2=badgeColor(i)
+          return <g key={f.id}>
+            <circle cx={MAIN_W+14} cy={ly} r={7} fill={bc2} stroke="white" strokeWidth="1"/>
+            <text x={MAIN_W+14} y={ly+3} textAnchor="middle" fontSize="7.5" fill="white" fontFamily="Arial,sans-serif" fontWeight="800">{i+1}</text>
+            <rect x={MAIN_W+25} y={ly-5} width={10} height={10} fill={lh(f.color||'#888',.5)} stroke={dh(f.color||'#888',.15)} strokeWidth="1" rx="2"/>
+            <text x={MAIN_W+38} y={ly+3} fontSize="9.5" fill="#374151" fontFamily="Arial,sans-serif">{f.label.length>14?f.label.slice(0,13)+'…':f.label}</text>
+          </g>
+        })}
+      </svg>
     </div>
   )
 }
+
 
 const STEPS = [
   { num: 1, label: 'Room' },
