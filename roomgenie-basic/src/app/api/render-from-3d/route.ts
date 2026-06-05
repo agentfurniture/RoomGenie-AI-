@@ -8,37 +8,31 @@ export async function POST(req: Request) {
     const { image, style, roomType, layoutJSON } = await req.json()
     if (!image) return NextResponse.json({ error: 'No image provided' }, { status: 400 })
 
-    // Build description of what's in the 3D scene from layoutJSON
     const furniture = (layoutJSON?.furniture || [])
       .filter((f: { type: string; heightFt: number }) => f.type !== 'rug' && f.heightFt > 0.8)
       .map((f: { label: string; color: string; material: string }) => `${f.label} in ${f.color} ${f.material}`)
       .slice(0, 8)
       .join(', ')
 
-    const wallColor  = layoutJSON?.walls?.color  || 'neutral'
+    const wallColor  = layoutJSON?.walls?.color    || 'neutral white'
     const floorMat   = layoutJSON?.floor?.material || 'hardwood'
-    const floorColor = layoutJSON?.floor?.color    || 'warm'
+    const floorColor = layoutJSON?.floor?.color    || 'warm wood'
     const dims       = layoutJSON?.dimensions
-    const dimStr     = dims ? `${dims.widthFt}x${dims.lengthFt}ft room` : 'room'
+    const dimStr     = dims ? `${dims.widthFt}x${dims.lengthFt}ft` : ''
 
-    // Prompt tells OpenAI to preserve the exact layout from the 3D image
-    // and render it photorealistically
     const prompt = [
       `Transform this 3D room model into a photorealistic interior design photograph.`,
-      `Preserve EXACTLY the same furniture layout, positions, and room proportions shown in the image.`,
-      `Style: ${style}. Room type: ${roomType}. Dimensions: ${dimStr}.`,
-      `Furniture to keep in same positions: ${furniture}.`,
-      `Floor: ${floorMat} in ${floorColor}. Walls: ${wallColor}.`,
-      `Add realistic textures, materials, lighting and shadows.`,
-      `Make it look like a professional Architectural Digest interior photograph.`,
-      `Wide angle shot. Perfect lighting. No people. No text.`,
-    ].join(' ')
+      `Preserve EXACTLY the same furniture layout, positions, and proportions shown in the 3D image.`,
+      `Style: ${style}. Room: ${roomType}. ${dimStr ? 'Size: ' + dimStr + '.' : ''}`,
+      furniture ? `Furniture in same positions: ${furniture}.` : '',
+      `Floor: ${floorMat} ${floorColor}. Walls: ${wallColor}.`,
+      `Add realistic textures, materials, soft shadows and professional interior lighting.`,
+      `Wide angle shot showing the full room. Architectural Digest quality. No people. No text.`,
+    ].filter(Boolean).join(' ')
 
-    // Convert base64 to buffer for OpenAI
     const imageBuffer = Buffer.from(image, 'base64')
-    const imageFile   = new File([imageBuffer], 'room-3d.png', { type: 'image/png' })
+    const imageFile   = new File([imageBuffer], 'room.png', { type: 'image/png' })
 
-    // Use gpt-image-1 edit endpoint — takes the 3D render as input and makes it photorealistic
     const response = await openai.images.edit({
       model:  'gpt-image-1',
       image:  imageFile,
@@ -52,7 +46,7 @@ export async function POST(req: Request) {
 
     const imageUrl = item.b64_json
       ? `data:image/png;base64,${item.b64_json}`
-      : item.url || ''
+      : (item.url || '')
 
     return NextResponse.json({ image: imageUrl })
   } catch (err: unknown) {
