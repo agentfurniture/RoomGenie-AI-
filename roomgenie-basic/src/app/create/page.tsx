@@ -18,469 +18,244 @@ function hexToRgb(hex: string): [number, number, number] {
 }
 
 /* ─── 3D ROOM VIEWER ─────────────────────────────────────────────── */
-function RoomViewer3D({ layoutJSON, style, roomType, onCapture }: { layoutJSON: LayoutJSON; style: string; roomType: string; onCapture?: (base64: string) => void }) {
-  const mountRef  = useRef<HTMLDivElement>(null)
-  const rafRef    = useRef<number>(0)
-  const angleRef  = useRef(0.65)   // start at a corner angle matching photo render
-  const vertRef   = useRef(0.22)   // eye-level — not bird's eye
-  const dragging  = useRef(false)
-  const lastPos   = useRef({ x: 0, y: 0 })
-  const autoRef   = useRef(true)
-  const [auto, setAuto]   = useState(true)
-  const [ready, setReady] = useState(false)
+function RoomViewer3D({ layoutJSON, style, roomType, onCapture }: {
+  layoutJSON: LayoutJSON; style: string; roomType: string; onCapture?: (base64: string) => void
+}) {
+  const svgRef = useRef<SVGSVGElement>(null)
+  const [angle, setAngle] = useState(0)   // 0=front-left, 1=front-right, 2=back-right, 3=back-left
 
-  useEffect(() => {
-    const mount = mountRef.current
-    if (!mount) return
-    let disposed = false
-    let raf = 0
-    let cleanupFn: (() => void) | null = null
+  const VW = 800, VH = 520
+  const { widthFt: W, lengthFt: L, heightFt: H } = layoutJSON.dimensions
 
-    const run = async () => {
-      const THREE = await import('three')
-      if (disposed) return
+  // Isometric projection constants
+  // We render a room with 4 viewpoints the user can cycle through
+  const VIEWS = ['↙ Front Left', '↘ Front Right', '↗ Back Right', '↖ Back Left']
 
-      const W_PX = Math.max(mount.offsetWidth, 300)
-      const H_PX = 400
+  // Project 3D room coords (x=right, y=up, z=depth) to SVG 2D
+  // Room coords: (0,0,0)=bottom-far-left, (W,0,0)=bottom-far-right, (0,H,0)=top-far-left, (0,0,L)=bottom-near-left
+  function iso(rx: number, ry: number, rz: number): [number, number] {
+    // Scale to pixels
+    const scale = Math.min((VW - 80) / (W + L) * 0.82, (VH - 60) / (H + (W + L) * 0.5) * 0.9)
+    const px = W * scale, pz = L * scale, ph = H * scale
 
-      // Create canvas programmatically
-      const canvas = document.createElement('canvas')
-      canvas.style.cssText = `width:100%;height:${H_PX}px;display:block;cursor:grab;`
-      mount.appendChild(canvas)
-      if (disposed) { if (canvas.parentNode) canvas.parentNode.removeChild(canvas); return }
+    // Rotate viewpoint
+    let fx = rx, fz = rz
+    if (angle === 1) { fx = W - rz; fz = rx }
+    if (angle === 2) { fx = W - rx; fz = L - rz }
+    if (angle === 3) { fx = rz;     fz = L - rx }
 
-      const { widthFt: W, lengthFt: L, heightFt: H } = layoutJSON.dimensions
-      const cx = W / 2, cz = L / 2
+    const ix = (fx - fz) * 0.6 * scale * (W / Math.max(W, L))
+    const iy = (fx + fz) * 0.3 * scale - ry * scale
 
-      const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' })
-      renderer.setSize(W_PX, H_PX)
-      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
-      renderer.shadowMap.enabled = true
-      renderer.shadowMap.type    = THREE.PCFSoftShadowMap
-      renderer.toneMapping       = THREE.ACESFilmicToneMapping
-      renderer.toneMappingExposure = 1.25
+    // Center in SVG
+    const cx = VW / 2
+    const cy = VH * 0.72
+    return [cx + ix, cy + iy]
+  }
 
-      const scene = new THREE.Scene()
-      const [wr, wg, wb] = hexToRgb(layoutJSON.walls.color || '#F5F2ED')
-      scene.background = new THREE.Color(
-        Math.min(wr * 1.15, 1),
-        Math.min(wg * 1.15, 1),
-        Math.min(wb * 1.15, 1)
-      )
+  function hexToRgb(hex: string): [number, number, number] {
+    const h = (hex || '#888888').replace('#', '')
+    if (h.length !== 6) return [0.5, 0.5, 0.5]
+    return [parseInt(h.slice(0,2),16)/255, parseInt(h.slice(2,4),16)/255, parseInt(h.slice(4,6),16)/255]
+  }
 
-      const camera = new THREE.PerspectiveCamera(58, W_PX / H_PX, 0.1, 200)
-      const dist = Math.max(W, L) * 1.05
+  function lighten(hex: string, amt = 0.3): string {
+    const [r,g,b] = hexToRgb(hex)
+    const l = (v: number) => Math.round(Math.min((v + amt) * 255, 255))
+    return `rgb(${l(r)},${l(g)},${l(b)})`
+  }
+  function darken(hex: string, amt = 0.2): string {
+    const [r,g,b] = hexToRgb(hex)
+    const d = (v: number) => Math.round(Math.max((v - amt) * 255, 0))
+    return `rgb(${d(r)},${d(g)},${d(b)})`
+  }
 
-      function updateCam() {
-        const a = angleRef.current, v = vertRef.current
-        camera.position.set(
-          cx + dist * Math.sin(a) * Math.cos(v),
-          H  * 0.35 + dist * Math.sin(v),
-          cz + dist * Math.cos(a) * Math.cos(v)
-        )
-        camera.lookAt(cx, H * 0.28, cz)
-      }
-      updateCam()
+  const wallC  = layoutJSON.walls.color  || '#F5F2ED'
+  const floorC = layoutJSON.floor.color  || '#C4A882'
 
-      // ── Lighting matching the photorealistic render ────────────────────────
-      // Warm ambient base
-      scene.add(new THREE.AmbientLight(0xfff8f0, 0.55))
+  // Build SVG paths for the room shell
+  function roomShell() {
+    // Floor polygon
+    const fl0 = iso(0,0,0), fl1 = iso(W,0,0), fl2 = iso(W,0,L), fl3 = iso(0,0,L)
+    const floorPts = [fl0,fl1,fl2,fl3].map(p=>p.join(',')).join(' ')
 
-      // Main key light — warm, from upper corner (matches window light in photo)
-      const key = new THREE.DirectionalLight(0xfff0d0, 2.2)
-      key.position.set(W * 0.8, H * 2.5, -L * 0.3)
-      key.castShadow = true
-      key.shadow.mapSize.set(2048, 2048)
-      key.shadow.camera.left   = -W * 1.8
-      key.shadow.camera.right  =  W * 1.8
-      key.shadow.camera.top    =  L * 1.8
-      key.shadow.camera.bottom = -L * 1.8
-      key.shadow.bias = -0.001
-      key.shadow.radius = 3
-      scene.add(key)
+    // Left wall (facing viewer left)
+    const lw0=iso(0,0,0),lw1=iso(0,H,0),lw2=iso(0,H,L),lw3=iso(0,0,L)
+    const leftPts = [lw0,lw1,lw2,lw3].map(p=>p.join(',')).join(' ')
 
-      // Soft fill from opposite side — prevents harsh shadows
-      const fill = new THREE.DirectionalLight(0xe8f0ff, 0.7)
-      fill.position.set(-W * 0.6, H * 1.2, L * 0.8)
-      scene.add(fill)
+    // Right wall (facing viewer right)
+    const rw0=iso(W,0,0),rw1=iso(W,H,0),rw2=iso(0,H,0),rw3=iso(0,0,0)
+    const rightPts = [rw0,rw1,rw2,rw3].map(p=>p.join(',')).join(' ')
 
-      // Warm bounce light from floor
-      const bounce = new THREE.HemisphereLight(0xfff5e0, hexToRgb(layoutJSON.floor.color || '#C4A882').join(',') as unknown as number, 0.4)
-      scene.add(bounce)
+    // Ceiling strip (just the top edge lines)
+    const c0=iso(0,H,0),c1=iso(W,H,0),c2=iso(W,H,L),c3=iso(0,H,L)
+    const ceilPts = [c0,c1,c2,c3].map(p=>p.join(',')).join(' ')
 
-      // ── Room shell ────────────────────────────────────────────────────────
-      function mkMat(color: string, roughness = 0.85, metalness = 0) {
-        return new THREE.MeshStandardMaterial({ color: new THREE.Color(...hexToRgb(color)), roughness, metalness })
-      }
-      function addBox(w: number, h: number, d: number, x: number, y: number, z: number, m: import('three').Material, sh = true) {
-        const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m)
-        mesh.position.set(x, y, z)
-        if (sh) { mesh.castShadow = true; mesh.receiveShadow = true }
-        scene.add(mesh); return mesh
-      }
+    return (
+      <>
+        {/* Floor */}
+        <polygon points={floorPts} fill={darken(floorC, 0.05)} stroke={darken(floorC,0.2)} strokeWidth="1.5"/>
+        {/* Floor planks */}
+        {Array.from({length: Math.floor(W*1.5)}, (_,i) => {
+          const x = (i / Math.floor(W*1.5)) * W
+          const a = iso(x,0,0), b = iso(x,0,L)
+          return <line key={`fp${i}`} x1={a[0]} y1={a[1]} x2={b[0]} y2={b[1]} stroke={darken(floorC,0.12)} strokeWidth="0.5" opacity="0.4"/>
+        })}
+        {/* Left wall */}
+        <polygon points={leftPts} fill={lighten(wallC, 0.06)} stroke={darken(wallC,0.15)} strokeWidth="1"/>
+        {/* Right wall */}
+        <polygon points={rightPts} fill={darken(wallC, 0.06)} stroke={darken(wallC,0.15)} strokeWidth="1"/>
+        {/* Ceiling edge */}
+        <polygon points={ceilPts} fill="rgba(255,255,255,0.5)" stroke={darken(wallC,0.1)} strokeWidth="1"/>
+        {/* Wall grid lines left wall */}
+        {Array.from({length:3},(_,i)=>{
+          const y=(i+1)*H/4; const a=iso(0,y,0),b=iso(0,y,L)
+          return <line key={`wl${i}`} x1={a[0]} y1={a[1]} x2={b[0]} y2={b[1]} stroke={darken(wallC,0.08)} strokeWidth="0.5" opacity="0.3"/>
+        })}
+      </>
+    )
+  }
 
-      // Use actual colors from layoutJSON
-      const wallColor  = layoutJSON.walls.color  || '#F5F2ED'
-      const floorColor = layoutJSON.floor.color  || '#C4A882'
-      const isMarble   = layoutJSON.floor.material === 'marble'
-      const isConcrete = layoutJSON.floor.material === 'concrete'
+  // Render a furniture piece as isometric boxes
+  function renderFurniture(f: LayoutJSON['furniture'][0]) {
+    const x = f.xFrac * W
+    const z = f.yFrac * L
+    const fw = f.wFrac * W
+    const fd = f.dFrac * L
+    const fh = Math.max(f.heightFt, 0.08)
+    const fc = f.color || '#8B8680'
 
-      const wallM  = mkMat(wallColor,  0.92, 0)
-      const floorM = mkMat(floorColor, isMarble ? 0.08 : isConcrete ? 0.98 : 0.72, isMarble ? 0.06 : 0)
-      const ceilM  = mkMat('#FAFAFA', 0.96, 0)
-
-      // Floor
-      const fl = new THREE.Mesh(new THREE.PlaneGeometry(W, L), floorM)
-      fl.rotation.x = -Math.PI / 2; fl.position.set(cx, 0, cz); fl.receiveShadow = true; scene.add(fl)
-
-      // Ceiling
-      const cl = new THREE.Mesh(new THREE.PlaneGeometry(W, L), ceilM)
-      cl.rotation.x = Math.PI / 2; cl.position.set(cx, H, cz); scene.add(cl)
-
-      // Back wall (full)
-      addBox(W + 0.36, H, 0.18, cx, H/2, 0, wallM)
-      // Left wall (full)
-      addBox(0.18, H, L, 0, H/2, cz, wallM)
-      // Right wall (with window cutout — invisible segment replaced by glass)
-      const winBottom = H * 0.22, winTop = H * 0.82, winStart = cz - L * 0.18, winEnd = cz + L * 0.18
-      // Right wall — below window
-      addBox(0.18, winBottom, L, W, winBottom/2, cz, wallM)
-      // Right wall — above window
-      addBox(0.18, H - winTop, L, W, winTop + (H-winTop)/2, cz, wallM)
-      // Right wall — left of window
-      addBox(0.18, winTop - winBottom, winStart, W, winBottom + (winTop-winBottom)/2, winStart/2, wallM)
-      // Right wall — right of window
-      const rightSegLen = L - winEnd
-      addBox(0.18, winTop - winBottom, rightSegLen, W, winBottom + (winTop-winBottom)/2, winEnd + rightSegLen/2, wallM)
-
-      // Window glass
-      const glassM = new THREE.MeshStandardMaterial({ color: new THREE.Color(0.75, 0.90, 1.0), roughness: 0.03, metalness: 0.05, transparent: true, opacity: 0.22 })
-      const win = new THREE.Mesh(new THREE.BoxGeometry(0.08, winTop - winBottom, winEnd - winStart), glassM)
-      win.position.set(W, winBottom + (winTop-winBottom)/2, cx); scene.add(win)
-
-      // Window frame
-      const frameM = mkMat('#E8E8E8', 0.5)
-      addBox(0.12, 0.06, winEnd-winStart+0.1, W, winBottom, cx, frameM, false)
-      addBox(0.12, 0.06, winEnd-winStart+0.1, W, winTop, cx, frameM, false)
-      addBox(0.12, winTop-winBottom, 0.06, W, winBottom+(winTop-winBottom)/2, winStart, frameM, false)
-      addBox(0.12, winTop-winBottom, 0.06, W, winBottom+(winTop-winBottom)/2, winEnd, frameM, false)
-
-      // Front wall — partial (split with viewing gap)
-      addBox(W * 0.18, H, 0.18, W * 0.09, H/2, L, wallM)
-      addBox(W * 0.18, H, 0.18, W * 0.91, H/2, L, wallM)
-      addBox(W * 0.64, H * 0.22, 0.18, cx, H * 0.89, L, wallM)  // header
-
-      // Skirting boards
-      const skM = mkMat(wallColor, 0.6)
-      addBox(W, 0.12, 0.06, cx, 0.06, 0.03, skM, false)
-      addBox(0.06, 0.12, L, 0.03, 0.06, cz, skM, false)
-      addBox(0.06, 0.12, L, W-0.03, 0.06, cz, skM, false)
-
-      // Ceiling recessed light strips
-      const lightStripM = new THREE.MeshStandardMaterial({ color: new THREE.Color(1,1,0.9), emissive: new THREE.Color(0.5,0.45,0.2), emissiveIntensity: 0.6 })
-      ;[W*0.25, W*0.5, W*0.75].forEach(lx => {
-        const ls = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 0.04, 16), lightStripM)
-        ls.position.set(lx, H - 0.03, cz); scene.add(ls)
-        // Point light from each ceiling fixture
-        const pl = new THREE.PointLight(0xfff5e0, 0.35, W * 1.8)
-        pl.position.set(lx, H - 0.15, cz); scene.add(pl)
-      })
-
-      // Accent wall — if specified in layout
-      if (layoutJSON.walls.accentWall) {
-        const accentColor = layoutJSON.palette?.accent || '#4f7cff'
-        const accentM = mkMat(accentColor, 0.88)
-        // Apply accent to back wall (a panel)
-        addBox(W * 0.55, H * 0.72, 0.06, cx, H * 0.42, 0.12, accentM, false)
-      }
-
-      // ── Furniture ─────────────────────────────────────────────────────────
-      layoutJSON.furniture.forEach(f => {
-        const fw = Math.max(f.wFrac * W, 0.15)
-        const fd = Math.max(f.dFrac * L, 0.15)
-        const fh = Math.max(f.heightFt, 0.15)
-        const x  = f.xFrac * W
-        const z  = f.yFrac * L
-        const [r, g, b] = hexToRgb(f.color || '#8B8680')
-        const mat = (f.material || '').toLowerCase()
-        const isShiny = ['metal','glass','marble','ceramic','chrome','brass','gold'].some(m => mat.includes(m))
-        const isFabric = ['fabric','velvet','linen','wool','cotton','leather'].some(m => mat.includes(m))
-        const fm = new THREE.MeshStandardMaterial({
-          color:     new THREE.Color(r, g, b),
-          roughness: isShiny ? 0.15 : isFabric ? 0.92 : 0.78,
-          metalness: isShiny ? 0.65 : 0,
-        })
-        const grp = new THREE.Group()
-
-        if (f.type === 'rug') {
-          const rg = new THREE.Mesh(new THREE.BoxGeometry(fw, 0.03, fd), fm)
-          rg.position.set(fw/2, 0.015, fd/2); rg.receiveShadow = true; grp.add(rg)
-
-        } else if (f.type === 'sofa' || f.type === 'chaise') {
-          const seat = new THREE.Mesh(new THREE.BoxGeometry(fw, fh*.42, fd*.68), fm)
-          seat.position.set(fw/2, fh*.21, fd*.38); seat.castShadow=seat.receiveShadow=true; grp.add(seat)
-          const bk = new THREE.Mesh(new THREE.BoxGeometry(fw, fh*.60, fd*.20), fm)
-          bk.position.set(fw/2, fh*.34, fd*.10); bk.castShadow=true; grp.add(bk)
-          ;[0.05, 0.95].forEach(ax => {
-            const arm = new THREE.Mesh(new THREE.BoxGeometry(fw*.08, fh*.48, fd*.68), fm)
-            arm.position.set(fw*ax, fh*.27, fd*.38); arm.castShadow=true; grp.add(arm)
-          })
-          // Seat cushions
-          const cushM = new THREE.MeshStandardMaterial({ color: new THREE.Color(Math.min(r*1.08,1),Math.min(g*1.08,1),Math.min(b*1.08,1)), roughness: 0.95 })
-          const cushW = (fw - fw*.18) / 3
-          for (let ci = 0; ci < 3; ci++) {
-            const cush = new THREE.Mesh(new THREE.BoxGeometry(cushW*.92, fh*.12, fd*.60), cushM)
-            cush.position.set(fw*.09 + cushW*ci + cushW/2, fh*.38, fd*.35); grp.add(cush)
-          }
-          // Legs
-          const legM2 = new THREE.MeshStandardMaterial({ color: new THREE.Color(.2,.14,.08), roughness: 0.4, metalness: 0.1 })
-          ;[[.08,.88],[.92,.88],[.08,.12],[.92,.12]].forEach(([lx,lz]) => {
-            const lg = new THREE.Mesh(new THREE.CylinderGeometry(.035,.035,fh*.12,8), legM2)
-            lg.position.set(fw*lx, fh*.06, fd*lz); grp.add(lg)
-          })
-
-        } else if (f.type === 'bed' || f.type === 'murphy_bed') {
-          // Platform / base
-          const base = new THREE.Mesh(new THREE.BoxGeometry(fw, fh*.22, fd), fm)
-          base.position.set(fw/2, fh*.11, fd/2); base.castShadow=base.receiveShadow=true; grp.add(base)
-          // Mattress
-          const mattM = new THREE.MeshStandardMaterial({ color: new THREE.Color(.96,.94,.91), roughness: 0.95 })
-          const matt = new THREE.Mesh(new THREE.BoxGeometry(fw*.94, fh*.14, fd*.95), mattM)
-          matt.position.set(fw/2, fh*.33, fd/2); matt.castShadow=true; grp.add(matt)
-          // Headboard — tall feature matching photo renders
-          const hb = new THREE.Mesh(new THREE.BoxGeometry(fw, fh*.72, fd*.10), fm)
-          hb.position.set(fw/2, fh*.47, fd*.05); hb.castShadow=true; grp.add(hb)
-          // Headboard detail panel
-          const hbDetail = new THREE.MeshStandardMaterial({ color: new THREE.Color(Math.min(r*.85,1),Math.min(g*.85,1),Math.min(b*.85,1)), roughness: 0.7 })
-          const hbP = new THREE.Mesh(new THREE.BoxGeometry(fw*.88, fh*.56, fd*.04), hbDetail)
-          hbP.position.set(fw/2, fh*.47, fd*.06); grp.add(hbP)
-          // Pillows
-          const pilM = new THREE.MeshStandardMaterial({ color: new THREE.Color(.97,.96,1), roughness: 0.96 })
-          ;[.25,.52,.75].forEach(px => {
-            const pil = new THREE.Mesh(new THREE.BoxGeometry(fw*.22, fh*.10, fd*.14), pilM)
-            pil.position.set(fw*px, fh*.46, fd*.16); pil.castShadow=true; grp.add(pil)
-          })
-          // Duvet
-          const duvM = new THREE.MeshStandardMaterial({ color: new THREE.Color(.93,.90,.86), roughness: 0.97 })
-          const duv = new THREE.Mesh(new THREE.BoxGeometry(fw*.92, fh*.06, fd*.65), duvM)
-          duv.position.set(fw/2, fh*.46, fd*.57); grp.add(duv)
-          // Bed legs
-          const blM = new THREE.MeshStandardMaterial({ color: new THREE.Color(.22,.16,.10), roughness: 0.45 })
-          ;[[.05,.94],[.95,.94],[.05,.06],[.95,.06]].forEach(([lx,lz]) => {
-            const lg = new THREE.Mesh(new THREE.CylinderGeometry(.045,.045,fh*.16,8), blM)
-            lg.position.set(fw*lx, fh*.08, fd*lz); grp.add(lg)
-          })
-
-        } else if (['dining_table','coffee_table','island'].includes(f.type)) {
-          // Tabletop
-          const top = new THREE.Mesh(new THREE.BoxGeometry(fw, fh*.07, fd), fm)
-          top.position.set(fw/2, fh, fd/2); top.castShadow=top.receiveShadow=true; grp.add(top)
-          // Apron
-          const ap = new THREE.Mesh(new THREE.BoxGeometry(fw*.92, fh*.06, fd*.92), fm)
-          ap.position.set(fw/2, fh*.89, fd/2); grp.add(ap)
-          // Tapered legs
-          ;[[.08,.09],[.92,.09],[.08,.91],[.92,.91]].forEach(([lx,lz]) => {
-            const lg = new THREE.Mesh(new THREE.BoxGeometry(fw*.065, fh*.86, fw*.065), fm)
-            lg.position.set(fw*lx, fh*.43, fd*lz); lg.castShadow=true; grp.add(lg)
-          })
-
-        } else if (f.type === 'desk') {
-          const top = new THREE.Mesh(new THREE.BoxGeometry(fw, fh*.06, fd), fm)
-          top.position.set(fw/2, fh, fd/2); top.castShadow=top.receiveShadow=true; grp.add(top)
-          ;[.07,.93].forEach(lx => {
-            const sp = new THREE.Mesh(new THREE.BoxGeometry(fw*.07, fh*.93, fd), fm)
-            sp.position.set(fw*lx, fh*.465, fd/2); sp.castShadow=true; grp.add(sp)
-          })
-          // Monitor suggestion on desk
-          const monM = new THREE.MeshStandardMaterial({ color: new THREE.Color(.08,.08,.1), roughness:.05, metalness:.8 })
-          const mon = new THREE.Mesh(new THREE.BoxGeometry(fw*.3, fh*.45, .06), monM)
-          mon.position.set(fw*.55, fh*1.28, fd*.15); mon.castShadow=true; grp.add(mon)
-
-        } else if (['chair','armchair','dining_chair'].includes(f.type)) {
-          const seat = new THREE.Mesh(new THREE.BoxGeometry(fw, fh*.36, fd*.80), fm)
-          seat.position.set(fw/2, fh*.40, fd*.50); seat.castShadow=seat.receiveShadow=true; grp.add(seat)
-          const back = new THREE.Mesh(new THREE.BoxGeometry(fw, fh*.50, fd*.10), fm)
-          back.position.set(fw/2, fh*.66, fd*.05); back.castShadow=true; grp.add(back)
-          ;[[.15,.12],[.85,.12],[.15,.88],[.85,.88]].forEach(([lx,lz]) => {
-            const lg = new THREE.Mesh(new THREE.CylinderGeometry(.028,.028,fh*.38,8), fm)
-            lg.position.set(fw*lx, fh*.19, fd*lz); grp.add(lg)
-          })
-
-        } else if (f.type === 'stool') {
-          const seat = new THREE.Mesh(new THREE.CylinderGeometry(Math.min(fw,fd)*.42, Math.min(fw,fd)*.42, fh*.09, 16), fm)
-          seat.position.set(fw/2, fh, fd/2); seat.castShadow=true; grp.add(seat)
-          ;[[.3,.3],[.7,.3],[.3,.7],[.7,.7]].forEach(([lx,lz]) => {
-            const lg = new THREE.Mesh(new THREE.CylinderGeometry(.025,.025,fh*.88,8), fm)
-            lg.position.set(fw*lx, fh*.44, fd*lz); grp.add(lg)
-          })
-
-        } else if (['bookshelf','shelving','wardrobe','sideboard','cabinets_lower'].includes(f.type)) {
-          const body = new THREE.Mesh(new THREE.BoxGeometry(fw, fh, fd), fm)
-          body.position.set(fw/2, fh/2, fd/2); body.castShadow=body.receiveShadow=true; grp.add(body)
-          // Face frame
-          const frameM2 = new THREE.MeshStandardMaterial({ color: new THREE.Color(Math.min(r*.88,1),Math.min(g*.88,1),Math.min(b*.88,1)), roughness:.6 })
-          addBox(fw, fh, 0.04, fw/2, fh/2, fd+.02, frameM2 as import('three').Material, false)
-          // Shelves visible through front
-          const shCount = Math.max(2, Math.floor(fh / 1.0))
-          const shM = new THREE.MeshStandardMaterial({ color: new THREE.Color(Math.min(r*1.12,1),Math.min(g*1.12,1),Math.min(b*1.12,1)), roughness: .75 })
-          for (let s = 1; s < shCount; s++) {
-            const sh = new THREE.Mesh(new THREE.BoxGeometry(fw*.92, 0.04, fd*.84), shM)
-            sh.position.set(fw/2, (fh/shCount)*s, fd/2); grp.add(sh)
-          }
-          // Handle
-          const hndM = new THREE.MeshStandardMaterial({ color: new THREE.Color(.7,.65,.5), roughness:.2, metalness:.7 })
-          const hnd = new THREE.Mesh(new THREE.BoxGeometry(fw*.35, .04, .04), hndM)
-          hnd.position.set(fw/2, fh*.52, fd+.04); grp.add(hnd)
-
-        } else if (f.type === 'tv_unit') {
-          const body = new THREE.Mesh(new THREE.BoxGeometry(fw, fh, fd), fm)
-          body.position.set(fw/2, fh/2, fd/2); body.castShadow=body.receiveShadow=true; grp.add(body)
-          // TV screen floating above
-          const tvM = new THREE.MeshStandardMaterial({ color: new THREE.Color(.04,.04,.07), roughness:.03, metalness:.9 })
-          const tv = new THREE.Mesh(new THREE.BoxGeometry(fw*.88, fh*1.1, .07), tvM)
-          tv.position.set(fw/2, fh*1.32, fd*.04); tv.castShadow=true; grp.add(tv)
-          // Screen glow
-          const scM = new THREE.MeshStandardMaterial({ color: new THREE.Color(.06,.10,.22), emissive: new THREE.Color(.03,.06,.14), emissiveIntensity:.8 })
-          grp.add(Object.assign(new THREE.Mesh(new THREE.BoxGeometry(fw*.82, fh*1.01, .02), scM), { position: new THREE.Vector3(fw/2, fh*1.32, fd*.02) }))
-
-        } else if (['nightstand','side_table','dresser'].includes(f.type)) {
-          const body = new THREE.Mesh(new THREE.BoxGeometry(fw, fh*.82, fd), fm)
-          body.position.set(fw/2, fh*.41, fd/2); body.castShadow=body.receiveShadow=true; grp.add(body)
-          const topM3 = new THREE.MeshStandardMaterial({ color: new THREE.Color(Math.min(r*1.14,1),Math.min(g*1.14,1),Math.min(b*1.14,1)), roughness: isShiny ? .1 : .4 })
-          grp.add(Object.assign(new THREE.Mesh(new THREE.BoxGeometry(fw*1.02, fh*.07, fd*1.02), topM3), { position: new THREE.Vector3(fw/2, fh*.87, fd/2) }))
-          // Table lamp
-          const lpM2 = new THREE.MeshStandardMaterial({ color: new THREE.Color(.22,.16,.10), roughness:.35, metalness:.4 })
-          grp.add(Object.assign(new THREE.Mesh(new THREE.CylinderGeometry(fw*.09,fw*.12,fh*.06,10), lpM2), { position: new THREE.Vector3(fw*.7,fh*.94,fd*.5) }))
-          const shadeM2 = new THREE.MeshStandardMaterial({ color: new THREE.Color(.96,.88,.7), roughness:.9, side:THREE.DoubleSide, emissive:new THREE.Color(.3,.18,.05), emissiveIntensity:.5 })
-          grp.add(Object.assign(new THREE.Mesh(new THREE.CylinderGeometry(fw*.19,fw*.25,fh*.27,12,1,true), shadeM2), { position: new THREE.Vector3(fw*.7,fh*1.15,fd*.5) }))
-
-        } else if (f.type === 'floor_lamp') {
-          const poleM2 = new THREE.MeshStandardMaterial({ color: new THREE.Color(.78,.68,.48), roughness:.25, metalness:.7 })
-          grp.add(Object.assign(new THREE.Mesh(new THREE.CylinderGeometry(.03,.03,fh*.88,8), poleM2), { position: new THREE.Vector3(fw/2,fh*.44,fd/2) }))
-          const lsM2 = new THREE.MeshStandardMaterial({ color: new THREE.Color(.96,.89,.74), roughness:.9, side:THREE.DoubleSide, emissive:new THREE.Color(.28,.17,.04), emissiveIntensity:.55 })
-          grp.add(Object.assign(new THREE.Mesh(new THREE.CylinderGeometry(fw*.5,fw*.7,fh*.21,14,1,true), lsM2), { position: new THREE.Vector3(fw/2,fh*.91,fd/2) }))
-          grp.add(Object.assign(new THREE.Mesh(new THREE.CylinderGeometry(fw*.32,fw*.38,.06,12), poleM2), { position: new THREE.Vector3(fw/2,.03,fd/2) }))
-
-        } else if (f.type === 'bathtub') {
-          const outer = new THREE.Mesh(new THREE.BoxGeometry(fw, fh, fd), fm)
-          outer.position.set(fw/2,fh/2,fd/2); outer.castShadow=outer.receiveShadow=true; grp.add(outer)
-          const iM2 = new THREE.MeshStandardMaterial({ color:new THREE.Color(.94,.97,.99), roughness:.06, metalness:.04 })
-          grp.add(Object.assign(new THREE.Mesh(new THREE.BoxGeometry(fw*.82,fh*.70,fd*.78), iM2), { position:new THREE.Vector3(fw/2,fh*.65,fd/2) }))
-
-        } else if (f.type === 'vanity') {
-          const body = new THREE.Mesh(new THREE.BoxGeometry(fw, fh*.58, fd), fm)
-          body.position.set(fw/2, fh*.29, fd/2); body.castShadow=body.receiveShadow=true; grp.add(body)
-          const mirM2 = new THREE.MeshStandardMaterial({ color:new THREE.Color(.72,.78,.85), roughness:.03, transparent:true, opacity:.62 })
-          grp.add(Object.assign(new THREE.Mesh(new THREE.BoxGeometry(fw*.9, fh*.54, .04), mirM2), { position:new THREE.Vector3(fw/2,fh*.87,fd*.02) }))
-          // Mirror frame
-          const mfM = mkMat('#C8B8A8', 0.4)
-          grp.add(Object.assign(new THREE.Mesh(new THREE.BoxGeometry(fw*.94, fh*.58, .06), mfM), { position:new THREE.Vector3(fw/2,fh*.87,fd*.01) }))
-
-        } else if (f.type === 'toilet') {
-          const tk = new THREE.Mesh(new THREE.BoxGeometry(fw, fh*.48, fd*.34), fm)
-          tk.position.set(fw/2,fh*.52,fd*.17); tk.castShadow=true; grp.add(tk)
-          grp.add(Object.assign(new THREE.Mesh(new THREE.BoxGeometry(fw*.82,fh*.30,fd*.68), fm), { position:new THREE.Vector3(fw/2,fh*.15,fd*.58) }))
-
-        } else if (f.type === 'shower') {
-          const gM2 = new THREE.MeshStandardMaterial({ color:new THREE.Color(.8,.92,.96), roughness:.04, transparent:true, opacity:.26 })
-          grp.add(Object.assign(new THREE.Mesh(new THREE.BoxGeometry(fw,fh,.06), gM2), { position:new THREE.Vector3(fw/2,fh/2,0) }))
-          grp.add(Object.assign(new THREE.Mesh(new THREE.BoxGeometry(.06,fh,fd), gM2), { position:new THREE.Vector3(0,fh/2,fd/2) }))
-          grp.add(Object.assign(new THREE.Mesh(new THREE.BoxGeometry(.06,fh,fd), gM2), { position:new THREE.Vector3(fw,fh/2,fd/2) }))
-          grp.add(Object.assign(new THREE.Mesh(new THREE.BoxGeometry(fw,.08,fd), fm), { position:new THREE.Vector3(fw/2,.04,fd/2) }))
-          // Shower head
-          const shhdM = new THREE.MeshStandardMaterial({ color:new THREE.Color(.75,.7,.6), roughness:.2, metalness:.7 })
-          grp.add(Object.assign(new THREE.Mesh(new THREE.CylinderGeometry(.08,.1,.06,12), shhdM), { position:new THREE.Vector3(fw*.25,fh*.88,fd*.25) }))
-
-        } else {
-          // Generic fallback with subtle detail
-          const body = new THREE.Mesh(new THREE.BoxGeometry(fw, fh, fd), fm)
-          body.position.set(fw/2,fh/2,fd/2); body.castShadow=body.receiveShadow=true; grp.add(body)
-        }
-
-        grp.position.set(x, 0, z)
-        grp.rotation.y = (f.rotation || 0) * Math.PI / 180
-        scene.add(grp)
-      })
-
-      setReady(true)
-
-      // Pointer handlers
-      function onDown(e: PointerEvent) { dragging.current=true; lastPos.current={x:e.clientX,y:e.clientY}; autoRef.current=false; setAuto(false); canvas.setPointerCapture(e.pointerId) }
-      function onMove(e: PointerEvent) {
-        if(!dragging.current) return
-        angleRef.current += (e.clientX-lastPos.current.x)*.007
-        vertRef.current   = Math.max(.02, Math.min(.75, vertRef.current-(e.clientY-lastPos.current.y)*.005))
-        lastPos.current   = {x:e.clientX,y:e.clientY}
-      }
-      function onUp() { dragging.current=false }
-      canvas.addEventListener('pointerdown',onDown); canvas.addEventListener('pointermove',onMove)
-      canvas.addEventListener('pointerup',onUp); canvas.addEventListener('pointerleave',onUp)
-
-      const ro = new ResizeObserver(() => { const w=mount.offsetWidth||500; renderer.setSize(w,H_PX); camera.aspect=w/H_PX; camera.updateProjectionMatrix() })
-      ro.observe(mount)
-
-      function animate() {
-        if(disposed) return
-        raf=requestAnimationFrame(animate)
-        if(autoRef.current&&!dragging.current) angleRef.current+=.003
-        updateCam()
-        renderer.render(scene,camera)
-      }
-      raf=requestAnimationFrame(animate)
-
-      cleanupFn = () => {
-        disposed=true; cancelAnimationFrame(raf)
-        canvas.removeEventListener('pointerdown',onDown); canvas.removeEventListener('pointermove',onMove)
-        canvas.removeEventListener('pointerup',onUp); canvas.removeEventListener('pointerleave',onUp)
-        ro.disconnect(); renderer.dispose()
-        if(canvas.parentNode) canvas.parentNode.removeChild(canvas)
-      }
+    if (f.type === 'rug') {
+      const p0=iso(x,0.02,z),p1=iso(x+fw,0.02,z),p2=iso(x+fw,0.02,z+fd),p3=iso(x,0.02,z+fd)
+      return <polygon key={f.id} points={[p0,p1,p2,p3].map(p=>p.join(',')).join(' ')}
+        fill={fc} stroke={darken(fc,0.2)} strokeWidth="1" opacity="0.75" strokeDasharray="3,2"/>
     }
 
-    run().catch(console.error)
-    return () => { disposed = true; if (cleanupFn) cleanupFn() }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [layoutJSON])
+    // Top face
+    const t0=iso(x,fh,z),    t1=iso(x+fw,fh,z)
+    const t2=iso(x+fw,fh,z+fd),t3=iso(x,fh,z+fd)
+    // Front-left face (z+fd side)
+    const fl0=iso(x,0,z+fd),  fl1=iso(x+fw,0,z+fd)
+    const fl2=iso(x+fw,fh,z+fd),fl3=iso(x,fh,z+fd)
+    // Front-right face (x+fw side)
+    const fr0=iso(x+fw,0,z),  fr1=iso(x+fw,0,z+fd)
+    const fr2=iso(x+fw,fh,z+fd),fr3=iso(x+fw,fh,z)
 
-  function saveImg() {
-    const c = mountRef.current?.querySelector('canvas') as HTMLCanvasElement|null
-    if(!c) return; const a=document.createElement('a'); a.href=c.toDataURL('image/png',.92); a.download='3d-room.png'; a.click()
+    const topPts  = [t0,t1,t2,t3].map(p=>p.join(',')).join(' ')
+    const leftPts2 = [fl0,fl1,fl2,fl3].map(p=>p.join(',')).join(' ')
+    const rightPts2= [fr0,fr1,fr2,fr3].map(p=>p.join(',')).join(' ')
+
+    // Add label on top face if big enough
+    const midTop = [(t0[0]+t2[0])/2, (t0[1]+t2[1])/2]
+    const labelSize = Math.max(7, Math.min(10, fw * 8))
+    const showLabel = fw > 1.5 && fd > 0.8
+
+    return (
+      <g key={f.id}>
+        {/* Left visible face */}
+        <polygon points={leftPts2}  fill={darken(fc, 0.15)} stroke={darken(fc,0.25)} strokeWidth="0.8"/>
+        {/* Right visible face */}
+        <polygon points={rightPts2} fill={darken(fc, 0.08)} stroke={darken(fc,0.25)} strokeWidth="0.8"/>
+        {/* Top face */}
+        <polygon points={topPts}    fill={lighten(fc, 0.15)} stroke={darken(fc,0.2)}  strokeWidth="0.8"/>
+        {/* Detail: bed headboard */}
+        {(f.type==='bed'||f.type==='murphy_bed') && (() => {
+          const hb0=iso(x,fh*0.6,z), hb1=iso(x+fw,fh*0.6,z), hb2=iso(x+fw,fh,z), hb3=iso(x,fh,z)
+          return <polygon points={[hb0,hb1,hb2,hb3].map(p=>p.join(',')).join(' ')} fill={darken(fc,0.05)} stroke={darken(fc,0.2)} strokeWidth="0.8"/>
+        })()}
+        {/* Detail: sofa back */}
+        {f.type==='sofa' && (() => {
+          const sb0=iso(x,fh*0.55,z), sb1=iso(x+fw,fh*0.55,z), sb2=iso(x+fw,fh,z), sb3=iso(x,fh,z)
+          return <polygon points={[sb0,sb1,sb2,sb3].map(p=>p.join(',')).join(' ')} fill={darken(fc,0.08)} stroke={darken(fc,0.2)} strokeWidth="0.8"/>
+        })()}
+        {/* Label */}
+        {showLabel && <text x={midTop[0]} y={midTop[1]} textAnchor="middle" fontSize={labelSize}
+          fill={darken(fc,0.6)} fontFamily="Arial,sans-serif" fontWeight="600"
+          style={{pointerEvents:'none'}}>
+          {f.label.length > 12 ? f.label.slice(0,11)+'…' : f.label}
+        </text>}
+      </g>
+    )
   }
+
+  // Sort furniture back-to-front for correct painter's algorithm
+  const sorted = [...layoutJSON.furniture].sort((a, b) => {
+    const ac = a.yFrac + a.xFrac * 0.01
+    const bc = b.yFrac + b.xFrac * 0.01
+    return ac - bc
+  })
 
   function captureForPhoto() {
-    const c = mountRef.current?.querySelector('canvas') as HTMLCanvasElement|null
-    if(!c || !onCapture) return
-    // Get base64 without the data:image/png;base64, prefix
-    const b64 = c.toDataURL('image/png', 1.0).split(',')[1]
-    onCapture(b64)
+    if (!svgRef.current || !onCapture) return
+    const svgEl  = svgRef.current
+    const xml    = new XMLSerializer().serializeToString(svgEl)
+    const b64    = btoa(unescape(encodeURIComponent(xml)))
+    const img    = new Image()
+    img.onload = () => {
+      const c   = document.createElement('canvas')
+      c.width   = VW; c.height = VH
+      const ctx = c.getContext('2d')!
+      ctx.fillStyle = '#ffffff'
+      ctx.fillRect(0, 0, VW, VH)
+      ctx.drawImage(img, 0, 0)
+      const pngB64 = c.toDataURL('image/png', 1.0).split(',')[1]
+      onCapture(pngB64)
+    }
+    img.src = `data:image/svg+xml;base64,${b64}`
   }
 
+  const bgColor = lighten(wallC, 0.12)
+
   return (
-    <div ref={mountRef} style={{ position:'relative', borderRadius:16, overflow:'hidden', background:'#1a1a2e', minHeight:400 }}>
-      {!ready && (
-        <div style={{ position:'absolute', inset:0, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', zIndex:10, background:'#0f172a' }}>
-          <div style={{ width:32, height:32, border:'3px solid rgba(79,124,255,.25)', borderTopColor:'#4f7cff', borderRadius:'50%', animation:'spin .8s linear infinite', marginBottom:12 }} />
-          <p style={{ fontSize:12, color:'#475569', fontFamily:'inherit' }}>Building 3D room…</p>
-        </div>
+    <div style={{ borderRadius: 16, overflow: 'hidden', background: bgColor, position: 'relative', border: `1px solid ${darken(wallC, 0.08)}` }}>
+      {/* View angle selector */}
+      <div style={{ position: 'absolute', top: 10, left: 10, zIndex: 5, display: 'flex', gap: 4 }}>
+        <div style={{ background: 'rgba(0,0,0,.55)', backdropFilter: 'blur(8px)', borderRadius: 8, padding: '4px 10px', fontSize: 11, fontWeight: 700, color: 'white', border: '1px solid rgba(255,255,255,.12)' }}>✦ 3D View</div>
+        {VIEWS.map((v, i) => (
+          <button key={i} onClick={() => setAngle(i)}
+            style={{ background: angle===i ? 'rgba(79,124,255,.85)' : 'rgba(0,0,0,.5)', backdropFilter: 'blur(8px)', borderRadius: 8, padding: '4px 9px', fontSize: 10, fontWeight: 700, color: 'white', border: `1px solid ${angle===i?'rgba(79,124,255,.6)':'rgba(255,255,255,.1)'}`, cursor: 'pointer', fontFamily: 'inherit' }}>
+            {v}
+          </button>
+        ))}
+      </div>
+      {/* Capture button */}
+      {onCapture && (
+        <button onClick={captureForPhoto}
+          style={{ position: 'absolute', bottom: 10, right: 130, zIndex: 5, background: 'rgba(245,158,11,.88)', borderRadius: 8, padding: '5px 12px', fontSize: 11, fontWeight: 700, color: 'white', border: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
+          📸 Make Photo from This View
+        </button>
       )}
-      {ready && (<>
-        <div style={{ position:'absolute', top:10, left:10, display:'flex', gap:6, zIndex:5 }}>
-          <div style={{ background:'rgba(0,0,0,.55)', backdropFilter:'blur(8px)', borderRadius:8, padding:'4px 10px', fontSize:11, fontWeight:700, color:'white', border:'1px solid rgba(255,255,255,.12)' }}>✦ 3D Live</div>
-          <button onClick={()=>{ autoRef.current=!auto; setAuto(a=>!a) }} style={{ background:'rgba(0,0,0,.55)', backdropFilter:'blur(8px)', borderRadius:8, padding:'4px 10px', fontSize:11, fontWeight:700, color:auto?'#4f7cff':'rgba(255,255,255,.5)', border:`1px solid ${auto?'rgba(79,124,255,.4)':'rgba(255,255,255,.12)'}`, cursor:'pointer', fontFamily:'inherit' }}>{auto?'⟳ Auto':'▶ Play'}</button>
-        </div>
-        <div style={{ position:'absolute', top:10, right:10, zIndex:5, background:'rgba(0,0,0,.5)', backdropFilter:'blur(8px)', borderRadius:8, padding:'4px 10px', fontSize:10, color:'rgba(255,255,255,.4)', border:'1px solid rgba(255,255,255,.08)' }}>Drag to orbit</div>
-        <div style={{ position:'absolute', bottom:10, right:10, zIndex:5, display:'flex', gap:6 }}>
-          {onCapture && (
-            <button onClick={captureForPhoto} style={{ background:'rgba(245,158,11,.9)', borderRadius:8, padding:'5px 12px', fontSize:11, fontWeight:700, color:'white', border:'none', cursor:'pointer', fontFamily:'inherit' }}>
-              📸 Make Photo from This View
-            </button>
-          )}
-          <button onClick={saveImg} style={{ background:'rgba(79,124,255,.85)', borderRadius:8, padding:'5px 12px', fontSize:11, fontWeight:700, color:'white', border:'none', cursor:'pointer', fontFamily:'inherit' }}>⬇ Save PNG</button>
-        </div>
-      </>)}
+      {/* Download SVG */}
+      <button onClick={() => {
+        const xml = new XMLSerializer().serializeToString(svgRef.current!)
+        const a = document.createElement('a'); a.href = 'data:image/svg+xml;charset=utf-8,'+encodeURIComponent(xml); a.download='3d-room.svg'; a.click()
+      }} style={{ position: 'absolute', bottom: 10, right: 10, zIndex: 5, background: 'rgba(79,124,255,.85)', borderRadius: 8, padding: '5px 12px', fontSize: 11, fontWeight: 700, color: 'white', border: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>⬇ Save</button>
+
+      <svg ref={svgRef} viewBox={`0 0 ${VW} ${VH}`} width="100%" height="420"
+        xmlns="http://www.w3.org/2000/svg" style={{ display: 'block' }}>
+        <rect width={VW} height={VH} fill={bgColor}/>
+        {/* Room label */}
+        <text x={VW/2} y={22} textAnchor="middle" fontSize="13" fontWeight="700" fill={darken(wallC,0.5)} fontFamily="Arial,sans-serif">
+          {style} {roomType} · {layoutJSON.dimensions.widthFt}′ × {layoutJSON.dimensions.lengthFt}′ · {layoutJSON.dimensions.sqft} sq ft
+        </text>
+        {/* Room shell */}
+        {roomShell()}
+        {/* Furniture */}
+        {sorted.map(f => renderFurniture(f))}
+        {/* Dimension labels */}
+        {(() => {
+          const a=iso(0,0,L), b=iso(W,0,L)
+          return <text x={(a[0]+b[0])/2} y={(a[1]+b[1])/2+18} textAnchor="middle" fontSize="11" fill={darken(floorC,0.4)} fontFamily="Arial,sans-serif">{layoutJSON.dimensions.widthFt}ft</text>
+        })()}
+        {(() => {
+          const a=iso(0,0,0), b=iso(0,0,L)
+          return <text x={(a[0]+b[0])/2-22} y={(a[1]+b[1])/2} textAnchor="middle" fontSize="11" fill={darken(floorC,0.4)} fontFamily="Arial,sans-serif" transform={`rotate(-35,${(a[0]+b[0])/2-22},${(a[1]+b[1])/2})`}>{layoutJSON.dimensions.lengthFt}ft</text>
+        })()}
+      </svg>
     </div>
   )
 }
+
 
 
 
