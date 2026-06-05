@@ -637,141 +637,10 @@ export async function POST(req: Request) {
     const svgString       = generateFloorPlanSVG(layout)
     const floorPlanDataUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgString)}`
 
-    // ── STAGE 4: Build photorealistic render prompt from the same JSON ────────
-    const { prompt, negative } = buildRenderPrompt(layout)
-    console.log('[Prompt]', prompt.slice(0, 120))
-
-    // ── STAGE 5: Build spatially-exact prompt from layoutJSON ────────────────
-    // Convert xFrac/yFrac/wFrac/dFrac into precise wall/position descriptions
-    // so the photorealistic render matches the 3D viewer and floor plan exactly
-
-    const W = layout.dimensions.widthFt
-    const L = layout.dimensions.lengthFt
-    const H = layout.dimensions.heightFt
-
-    // Describe each furniture piece with exact spatial position in human terms
-    const spatialFurniture = layout.furniture
-      .filter(f => f.type !== 'rug' && f.heightFt > 0.8)
-      .map(f => {
-        const fwFt = (f.wFrac * W).toFixed(1)
-        const fdFt = (f.dFrac * L).toFixed(1)
-        const fhFt = f.heightFt.toFixed(1)
-
-        // X position: left/center-left/center/center-right/right wall
-        const xPct = f.xFrac + f.wFrac / 2
-        const xDesc = xPct < 0.2  ? 'against the left wall' :
-                      xPct < 0.4  ? 'toward the left side' :
-                      xPct < 0.6  ? 'centered on the width' :
-                      xPct < 0.8  ? 'toward the right side' :
-                                    'against the right wall'
-
-        // Y position: far wall / middle / near (viewer side)
-        const yPct = f.yFrac + f.dFrac / 2
-        const yDesc = yPct < 0.25 ? 'against the far wall' :
-                      yPct < 0.5  ? 'in the back half of the room' :
-                      yPct < 0.75 ? 'in the front half of the room' :
-                                    'near the foreground'
-
-        return `${f.label} (${f.color} ${f.material}, ${fwFt}ft wide × ${fdFt}ft deep × ${fhFt}ft tall, ${xDesc}, ${yDesc})`
-      })
-
-    // Group furniture by wall for a natural architectural description
-    const farWallItems  = spatialFurniture.filter((_, i) => {
-      const f = layout.furniture.filter(f => f.type !== 'rug' && f.heightFt > 0.8)[i]
-      return f && (f.yFrac + f.dFrac / 2) < 0.3
-    }).join('; ')
-    const leftWallItems = spatialFurniture.filter((_, i) => {
-      const f = layout.furniture.filter(f => f.type !== 'rug' && f.heightFt > 0.8)[i]
-      return f && (f.xFrac + f.wFrac / 2) < 0.25
-    }).join('; ')
-    const rightWallItems = spatialFurniture.filter((_, i) => {
-      const f = layout.furniture.filter(f => f.type !== 'rug' && f.heightFt > 0.8)[i]
-      return f && (f.xFrac + f.wFrac / 2) > 0.75
-    }).join('; ')
-    const centerItems = spatialFurniture.filter((_, i) => {
-      const f = layout.furniture.filter(f => f.type !== 'rug' && f.heightFt > 0.8)[i]
-      if (!f) return false
-      const xc = f.xFrac + f.wFrac / 2
-      const yc = f.yFrac + f.dFrac / 2
-      return xc >= 0.25 && xc <= 0.75 && yc >= 0.3
-    }).join('; ')
-
-    const hasRug = layout.furniture.some(f => f.type === 'rug')
-    const rugDesc = hasRug ? `A ${layout.furniture.find(f => f.type === 'rug')?.color || 'neutral'} area rug defines the central zone.` : ''
-
-    const ceilDesc = H >= 12 ? `soaring ${H}ft vaulted ceiling` :
-                     H >= 10 ? `${H}ft high ceiling with generous vertical space` :
-                     H >= 9  ? `${H}ft ceiling` : `standard ${H}ft ceiling`
-
-    const photoPrompt = [
-      // ① Establish scene — room type first, always
-      `Photorealistic interior design photograph of a ${style} ${roomType}.`,
-
-      // ② Exact room dimensions
-      `The room is exactly ${W} feet wide by ${L} feet long with a ${ceilDesc}.`,
-
-      // ③ Surfaces — floor, walls, ceiling from layoutJSON
-      `Floor: ${layout.floor.material} in ${layout.floor.color}.`,
-      `Walls: painted ${layout.walls.color} in ${layout.walls.material}.`,
-      layout.walls.accentWall ? `Accent wall: ${layout.walls.accentWall}.` : '',
-      `Ceiling: ${layout.ceiling?.color || 'white'}.`,
-
-      // ④ Furniture placed against specific walls (matches 3D/2D exactly)
-      farWallItems   ? `Against the far wall: ${farWallItems}.`   : '',
-      leftWallItems  ? `Along the left wall: ${leftWallItems}.`   : '',
-      rightWallItems ? `Along the right wall: ${rightWallItems}.` : '',
-      centerItems    ? `In the center area: ${centerItems}.`      : '',
-      rugDesc,
-
-      // ⑤ Lighting from layoutJSON
-      `Lighting: ${layout.lighting.natural}. ${layout.lighting.ambient}. ${layout.lighting.accent}.`,
-
-      // ⑥ Style, mood, palette
-      `Style: ${layout.styleDetails}.`,
-      `Color palette: primary ${layout.palette.primary}, accent ${layout.palette.accent}.`,
-      `Mood: ${layout.mood}.`,
-      answers.mood     ? `Atmosphere: ${answers.mood}.`                 : '',
-      answers.material ? `Featured materials: ${answers.material}.`     : '',
-      custom           ? `Additional client requirements: ${custom}.`   : '',
-
-      // ⑦ Camera and quality
-      'Wide angle corner shot showing the entire room with all furniture clearly visible.',
-      'Professional architectural photography, Architectural Digest quality, perfect balanced lighting, 8K photorealistic.',
-      'No people, no text, no watermarks.',
-    ].filter(Boolean).join(' ')
-
-    console.log('[Prompt] Spatial layout prompt:', photoPrompt.slice(0, 200))
-
-    // Try OpenAI gpt-image-1 — if fails, retry with simpler prompt
-    let photoImage = await generateImage(photoPrompt)
-
-    if (!photoImage) {
-      console.log('[OpenAI] First attempt failed, retrying with simpler prompt...')
-      const mustHave = ({
-        'Living Room':  'sofa against far wall, coffee table in center, TV unit',
-        'Bedroom':      'king bed against far wall centered, bedside tables each side, wardrobe on side wall',
-        'Kitchen':      'kitchen cabinets along walls, island in center, bar stools',
-        'Bathroom':     'freestanding bathtub, walk-in shower, double vanity',
-        'Home Office':  'large desk facing window, office chair, floor-to-ceiling bookshelves',
-        'Dining Room':  'dining table centered under light, chairs around it, sideboard on wall',
-        'Kids Room':    'single bed against wall, study desk by window, toy shelves, colorful rug',
-        'Master Suite': 'king bed centered on far wall, chaise lounge corner, dressing vanity',
-        'Studio':       'murphy wall bed, compact sofa, small round dining table',
-      } as Record<string, string>)[roomType] || ''
-      const simplePrompt = `${style} ${roomType} interior design: ${mustHave}. ${layout.floor.material} floor, ${layout.walls.color} walls. ${layout.styleDetails}. Wide angle architectural photography, photorealistic, 8K, no people.`
-      photoImage = await generateImage(simplePrompt)
-    }
-
-    const photoUrl = photoImage || getFallbackImage(style, roomType)
-    console.log('[Photo render]', photoImage ? 'OpenAI gpt-image-1 success ✓' : `Using curated fallback for ${style} ${roomType}`)
-
-    // ── STAGE 6: Return all 3 outputs ─────────────────────────────────────────
+    // ── STAGE 4: Return layout + floor plan (no image generation) ────────────
     return NextResponse.json({
-      // Output 1: Photorealistic render (Replicate SDXL)
-      image:     photoUrl,
-      // Output 2: SVG floor plan (deterministic from JSON)
+      image:     '',   // no photo render — OpenAI disabled
       floorPlan: floorPlanDataUrl,
-      // Output 3: layoutJSON → drives the Three.js 3D viewer on the frontend
       hasDimensions: true,
       dimensions: {
         w:    String(dims.widthFt),
@@ -785,7 +654,7 @@ export async function POST(req: Request) {
         description: layout.description || `A stunning ${style} ${roomType}.`,
         spatialNote: layout.spatialNotes || '',
         colors:      layout.colors      || [],
-        furniture:   layout.furniture.filter(f=>f.type!=='rug').map(f=>f.label).slice(0,6),
+        furniture:   layout.furniture.filter((f: { type: string }) => f.type !== 'rug').map((f: { label: string }) => f.label).slice(0, 6),
         tips:        layout.tips        || [],
         materials:   layout.materials   || [],
       },
