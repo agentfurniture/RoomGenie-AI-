@@ -18,7 +18,7 @@ function hexToRgb(hex: string): [number, number, number] {
 }
 
 /* ─── 3D ROOM VIEWER ─────────────────────────────────────────────── */
-function RoomViewer3D({ layoutJSON, style, roomType }: { layoutJSON: LayoutJSON; style: string; roomType: string }) {
+function RoomViewer3D({ layoutJSON, style, roomType, onCapture }: { layoutJSON: LayoutJSON; style: string; roomType: string; onCapture?: (base64: string) => void }) {
   const mountRef  = useRef<HTMLDivElement>(null)
   const rafRef    = useRef<number>(0)
   const angleRef  = useRef(0.65)   // start at a corner angle matching photo render
@@ -444,6 +444,14 @@ function RoomViewer3D({ layoutJSON, style, roomType }: { layoutJSON: LayoutJSON;
     if(!c) return; const a=document.createElement('a'); a.href=c.toDataURL('image/png',.92); a.download='3d-room.png'; a.click()
   }
 
+  function captureForPhoto() {
+    const c = mountRef.current?.querySelector('canvas') as HTMLCanvasElement|null
+    if(!c || !onCapture) return
+    // Get base64 without the data:image/png;base64, prefix
+    const b64 = c.toDataURL('image/png', 1.0).split(',')[1]
+    onCapture(b64)
+  }
+
   return (
     <div ref={mountRef} style={{ position:'relative', borderRadius:16, overflow:'hidden', background:'#1a1a2e', minHeight:400 }}>
       {!ready && (
@@ -458,7 +466,14 @@ function RoomViewer3D({ layoutJSON, style, roomType }: { layoutJSON: LayoutJSON;
           <button onClick={()=>{ autoRef.current=!auto; setAuto(a=>!a) }} style={{ background:'rgba(0,0,0,.55)', backdropFilter:'blur(8px)', borderRadius:8, padding:'4px 10px', fontSize:11, fontWeight:700, color:auto?'#4f7cff':'rgba(255,255,255,.5)', border:`1px solid ${auto?'rgba(79,124,255,.4)':'rgba(255,255,255,.12)'}`, cursor:'pointer', fontFamily:'inherit' }}>{auto?'⟳ Auto':'▶ Play'}</button>
         </div>
         <div style={{ position:'absolute', top:10, right:10, zIndex:5, background:'rgba(0,0,0,.5)', backdropFilter:'blur(8px)', borderRadius:8, padding:'4px 10px', fontSize:10, color:'rgba(255,255,255,.4)', border:'1px solid rgba(255,255,255,.08)' }}>Drag to orbit</div>
-        <button onClick={saveImg} style={{ position:'absolute', bottom:10, right:10, zIndex:5, background:'rgba(79,124,255,.85)', borderRadius:8, padding:'5px 12px', fontSize:11, fontWeight:700, color:'white', border:'none', cursor:'pointer', fontFamily:'inherit' }}>⬇ Save PNG</button>
+        <div style={{ position:'absolute', bottom:10, right:10, zIndex:5, display:'flex', gap:6 }}>
+          {onCapture && (
+            <button onClick={captureForPhoto} style={{ background:'rgba(245,158,11,.9)', borderRadius:8, padding:'5px 12px', fontSize:11, fontWeight:700, color:'white', border:'none', cursor:'pointer', fontFamily:'inherit' }}>
+              📸 Make Photo from This View
+            </button>
+          )}
+          <button onClick={saveImg} style={{ background:'rgba(79,124,255,.85)', borderRadius:8, padding:'5px 12px', fontSize:11, fontWeight:700, color:'white', border:'none', cursor:'pointer', fontFamily:'inherit' }}>⬇ Save PNG</button>
+        </div>
       </>)}
     </div>
   )
@@ -990,6 +1005,29 @@ export default function CreatePage() {
     const d    = result.design
     const dims = result.dimensions
     const [activeView, setActiveView] = useState<'photo'|'3d'|'plan'>('photo')
+    const [rendering, setRendering]   = useState(false)
+    const [photoUrl, setPhotoUrl]     = useState<string>(result.image)
+
+    // Called when user clicks "Make Photo from This View" in 3D viewer
+    async function handleCapture(base64: string) {
+      setRendering(true)
+      setActiveView('photo')
+      try {
+        const res  = await fetch('/api/render-from-3d', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            image:    base64,
+            style,
+            roomType,
+            layoutJSON: result.layoutJSON,
+          })
+        })
+        const data = await res.json()
+        if (data.image) setPhotoUrl(data.image)
+      } catch (e) { console.error('Render from 3D failed:', e) }
+      finally { setRendering(false) }
+    }
 
     return (
       <div ref={resultRef} style={{ marginTop: 36, borderTop: '2px solid #e0e7ff', paddingTop: 36 }}>
@@ -1034,8 +1072,15 @@ export default function CreatePage() {
         {activeView === 'photo' && (
           <div>
             <div style={{ borderRadius: 18, overflow: 'hidden', boxShadow: '0 12px 40px rgba(0,0,0,.14)', position: 'relative' }}>
-              <img src={result.image} alt={`${style} ${roomType}`}
-                style={{ width: '100%', display: 'block', maxHeight: 480, objectFit: 'cover' }}
+              {rendering && (
+                <div style={{ position:'absolute', inset:0, background:'rgba(15,23,42,0.75)', backdropFilter:'blur(4px)', display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', zIndex:10, borderRadius:18 }}>
+                  <div style={{ width:36, height:36, border:'3px solid rgba(245,158,11,.3)', borderTopColor:'#f59e0b', borderRadius:'50%', animation:'spin .8s linear infinite', marginBottom:14 }} />
+                  <p style={{ fontSize:14, fontWeight:700, color:'white', margin:0 }}>Rendering from 3D view…</p>
+                  <p style={{ fontSize:12, color:'rgba(255,255,255,.55)', marginTop:6 }}>OpenAI is making your 3D layout photorealistic</p>
+                </div>
+              )}
+              <img src={photoUrl} alt={`${style} ${roomType}`}
+                style={{ width: '100%', display: 'block', maxHeight: 480, objectFit: 'cover', opacity: rendering ? 0.4 : 1, transition: 'opacity 0.3s' }}
                 onError={e => { (e.target as HTMLImageElement).src = 'https://images.unsplash.com/photo-1618219908412-a29a1bb7b86e?w=1200&q=85&auto=format&fit=crop' }} />
               <div style={{ position: 'absolute', top: 14, left: 14, background: 'rgba(0,0,0,.6)', backdropFilter: 'blur(8px)', borderRadius: 9, padding: '5px 12px', fontSize: 12, fontWeight: 700, color: 'white', border: '1px solid rgba(255,255,255,.15)' }}>
                 📸 Photorealistic Render
@@ -1050,7 +1095,7 @@ export default function CreatePage() {
               )}
             </div>
             <div style={{ display: 'flex', gap: 10, marginTop: 12 }}>
-              <a href={result.image} target="_blank" rel="noopener"
+              <a href={photoUrl} target="_blank" rel="noopener"
                 style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7, padding: '11px', borderRadius: 12, background: 'linear-gradient(135deg,#f59e0b,#ef4444)', color: 'white', fontWeight: 700, fontSize: 13, textDecoration: 'none' }}>
                 ⬇ Save Render
               </a>
@@ -1063,8 +1108,8 @@ export default function CreatePage() {
                 🔄 Redesign
               </button>
             </div>
-            <div style={{ marginTop: 10, background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 10, padding: '10px 14px', fontSize: 12, color: '#92400e', lineHeight: 1.6 }}>
-              💡 Photorealistic render based on your exact style, room type, dimensions and furniture preferences. Switch to <strong>3D Viewer</strong> to orbit interactively, or <strong>Floor Plan</strong> for the layout.
+            <div style={{ marginTop: 10, background: '#f0f4ff', border: '1px solid #c7d2fe', borderRadius: 10, padding: '10px 14px', fontSize: 12, color: '#4f7cff', lineHeight: 1.6 }}>
+              💡 Switch to <strong>3D Viewer</strong>, orbit to your preferred angle, then click <strong>"📸 Make Photo from This View"</strong> to generate a photorealistic render of that exact layout and perspective.
             </div>
           </div>
         )}
@@ -1073,7 +1118,7 @@ export default function CreatePage() {
         {activeView === '3d' && (
           <div>
             {result.layoutJSON ? (
-              <RoomViewer3D layoutJSON={result.layoutJSON} style={style} roomType={roomType} />
+              <RoomViewer3D layoutJSON={result.layoutJSON} style={style} roomType={roomType} onCapture={handleCapture} />
             ) : (
               <div style={{ borderRadius: 16, background: '#0f172a', height: 360, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#64748b', fontSize: 14 }}>
                 3D data not available — please regenerate
