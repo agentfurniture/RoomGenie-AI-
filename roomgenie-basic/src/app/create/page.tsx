@@ -1020,7 +1020,7 @@ export default function CreatePage() {
             image:    base64,
             style,
             roomType,
-            layoutJSON: result.layoutJSON,
+            layoutJSON: result?.layoutJSON,
           })
         })
         const data = await res.json()
