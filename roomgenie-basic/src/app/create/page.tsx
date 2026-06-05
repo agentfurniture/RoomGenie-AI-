@@ -34,18 +34,20 @@ function RoomViewer3D({ layoutJSON, style, roomType, onCapture }: { layoutJSON: 
     if (!mount) return
     let disposed = false
     let raf = 0
+    let cleanupFn: (() => void) | null = null
 
-    ;(async () => {
+    const run = async () => {
       const THREE = await import('three')
       if (disposed) return
 
-      const W_PX = mount.offsetWidth || 500
+      const W_PX = Math.max(mount.offsetWidth, 300)
       const H_PX = 400
 
+      // Create canvas programmatically
       const canvas = document.createElement('canvas')
       canvas.style.cssText = `width:100%;height:${H_PX}px;display:block;cursor:grab;`
       mount.appendChild(canvas)
-      if (disposed) { mount.removeChild(canvas); return }
+      if (disposed) { if (canvas.parentNode) canvas.parentNode.removeChild(canvas); return }
 
       const { widthFt: W, lengthFt: L, heightFt: H } = layoutJSON.dimensions
       const cx = W / 2, cz = L / 2
@@ -59,24 +61,24 @@ function RoomViewer3D({ layoutJSON, style, roomType, onCapture }: { layoutJSON: 
       renderer.toneMappingExposure = 1.25
 
       const scene = new THREE.Scene()
-      // Use the actual wall color from layoutJSON for background — matches photo render
-      const wallRgb = hexToRgb(layoutJSON.walls.color || '#F5F2ED')
-      scene.background = new THREE.Color(...wallRgb).multiplyScalar(1.15)
-      scene.fog = new THREE.FogExp2(new THREE.Color(...wallRgb), 0.018)
+      const [wr, wg, wb] = hexToRgb(layoutJSON.walls.color || '#F5F2ED')
+      scene.background = new THREE.Color(
+        Math.min(wr * 1.15, 1),
+        Math.min(wg * 1.15, 1),
+        Math.min(wb * 1.15, 1)
+      )
 
-      // Eye-level perspective camera — matches photorealistic render angle
       const camera = new THREE.PerspectiveCamera(58, W_PX / H_PX, 0.1, 200)
-      // Closer distance for eye-level immersive view
       const dist = Math.max(W, L) * 1.05
 
       function updateCam() {
         const a = angleRef.current, v = vertRef.current
         camera.position.set(
           cx + dist * Math.sin(a) * Math.cos(v),
-          H  * 0.35 + dist * Math.sin(v),  // eye height ~35% up the wall
+          H  * 0.35 + dist * Math.sin(v),
           cz + dist * Math.cos(a) * Math.cos(v)
         )
-        camera.lookAt(cx, H * 0.28, cz)  // look slightly below center for natural perspective
+        camera.lookAt(cx, H * 0.28, cz)
       }
       updateCam()
 
@@ -426,16 +428,17 @@ function RoomViewer3D({ layoutJSON, style, roomType, onCapture }: { layoutJSON: 
       }
       raf=requestAnimationFrame(animate)
 
-      return () => {
+      cleanupFn = () => {
         disposed=true; cancelAnimationFrame(raf)
         canvas.removeEventListener('pointerdown',onDown); canvas.removeEventListener('pointermove',onMove)
         canvas.removeEventListener('pointerup',onUp); canvas.removeEventListener('pointerleave',onUp)
         ro.disconnect(); renderer.dispose()
         if(canvas.parentNode) canvas.parentNode.removeChild(canvas)
       }
-    })()
+    }
 
-    return () => { disposed=true; cancelAnimationFrame(rafRef.current) }
+    run().catch(console.error)
+    return () => { disposed = true; if (cleanupFn) cleanupFn() }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [layoutJSON])
 
