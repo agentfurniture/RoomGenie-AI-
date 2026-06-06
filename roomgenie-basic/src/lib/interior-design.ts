@@ -555,7 +555,7 @@ export const DESIGN_STYLES: Record<DesignStyle, StyleDefinition> = {
     floorColors: ['#1A1A1A','#2C2C2C','#8B6914','#D4AF37'],
     accentColors: ['#D4AF37','#C9A84C','#B8920A','#FFD700'],
     materials: ['velvet','marble','brass','gold','glass'],
-    floorMaterial: 'marble', wallFinish: 'lacquered',
+    floorMaterial: 'marble', wallFinish: 'paint',
     lighting: 'geometric brass chandelier, fan sconces, uplighters',
     moodWords: ['glamorous','bold','luxurious','geometric'],
     budgetRange: 'luxury',
