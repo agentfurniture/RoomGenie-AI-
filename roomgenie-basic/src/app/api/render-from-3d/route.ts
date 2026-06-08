@@ -1,10 +1,5 @@
 import { NextResponse } from 'next/server'
 
-/**
- * render-from-3d — Takes the 3D SVG capture and makes it photorealistic
- * Uses Nano Banana (Gemini 2.5 Flash Image) image editing
- * GEMINI_API_KEY required in Vercel environment variables
- */
 export async function POST(req: Request) {
   try {
     const { image, style, roomType, layoutJSON } = await req.json()
@@ -13,80 +8,68 @@ export async function POST(req: Request) {
     const apiKey = process.env.GEMINI_API_KEY
     if (!apiKey) return NextResponse.json({ error: 'GEMINI_API_KEY not set' }, { status: 500 })
 
-    // Build description from layoutJSON
     const furniture = (layoutJSON?.furniture || [])
       .filter((f: { type: string; heightFt: number }) => f.type !== 'rug' && f.heightFt > 0.8)
       .map((f: { label: string; color: string; material: string }) => `${f.label} in ${f.color} ${f.material}`)
       .slice(0, 8).join(', ')
 
-    const wallColor  = layoutJSON?.walls?.color    || 'neutral white'
-    const floorMat   = layoutJSON?.floor?.material || 'hardwood'
-    const dims       = layoutJSON?.dimensions
-    const dimStr     = dims ? `${dims.widthFt}×${dims.lengthFt}ft, ${dims.sqft} sqft` : ''
+    const dims   = layoutJSON?.dimensions
+    const dimStr = dims ? `${dims.widthFt}×${dims.lengthFt}ft, ${dims.sqft} sqft` : ''
 
     const prompt = [
-      `Transform this 3D room diagram into a photorealistic interior design photograph.`,
-      `IMPORTANT: Preserve the EXACT same furniture layout and positions shown in the image.`,
-      `Style: ${style}. Room type: ${roomType}. ${dimStr ? 'Dimensions: ' + dimStr + '.' : ''}`,
-      furniture ? `Furniture (keep in same positions): ${furniture}.` : '',
-      `Materials: ${floorMat} floor, ${wallColor} walls.`,
-      `Add realistic textures, accurate lighting, shadows, reflections.`,
-      `Wide angle professional interior photography shot. Architectural Digest quality.`,
-      `No people. No text. No watermarks.`,
+      `Transform this 3D isometric room diagram into a photorealistic interior design photograph.`,
+      `Preserve EXACTLY the same furniture layout, positions and proportions shown.`,
+      `Style: ${style}. Room: ${roomType}. ${dimStr ? 'Size: ' + dimStr + '.' : ''}`,
+      furniture ? `Furniture in same positions: ${furniture}.` : '',
+      `Add photorealistic textures, materials, professional interior lighting and shadows.`,
+      `Wide angle corner shot showing the full room. Magazine quality. No people. No text.`,
     ].filter(Boolean).join(' ')
 
-    console.log('[render-from-3d] Editing with Nano Banana (gemini-2.5-flash-image)...')
-
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${apiKey}`
-
-    const body = {
-      contents: [{
-        parts: [
-          {
-            inlineData: {
-              mimeType: 'image/png',
-              data:     image,  // base64 PNG of the SVG capture
-            }
-          },
-          { text: prompt }
-        ]
-      }],
-      generationConfig: {
-        responseModalities: ['IMAGE', 'TEXT'],
-      }
-    }
-
-    const resp = await fetch(url, {
+    // Try Imagen 3 first (best for photo-realistic edits)
+    const imagen3Url = `https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-generate-002:predict?key=${apiKey}`
+    const imagen3Resp = await fetch(imagen3Url, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify(body),
+      body: JSON.stringify({
+        instances:  [{ prompt }],
+        parameters: { sampleCount: 1, aspectRatio: '16:9', personGeneration: 'dont_allow' }
+      })
     })
 
-    if (!resp.ok) {
-      const errText = await resp.text()
-      console.error('[render-from-3d] Nano Banana error:', resp.status, errText.slice(0,200))
-      return NextResponse.json({ error: `Nano Banana error: ${resp.status}` }, { status: 500 })
+    if (imagen3Resp.ok) {
+      const data = await imagen3Resp.json()
+      const b64  = data.predictions?.[0]?.bytesBase64Encoded
+      if (b64) {
+        return NextResponse.json({ image: `data:image/png;base64,${b64}` })
+      }
     }
 
-    const data = await resp.json()
+    // Fallback: Gemini 2.0 Flash with image input (send the 3D SVG as reference)
+    const flashUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-preview-image-generation:generateContent?key=${apiKey}`
+    const flashResp = await fetch(flashUrl, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{
+          parts: [
+            { inlineData: { mimeType: 'image/png', data: image } },
+            { text: prompt }
+          ]
+        }],
+        generationConfig: { responseModalities: ['TEXT', 'IMAGE'] }
+      })
+    })
 
-    // Extract image from response
-    const candidates = data.candidates || []
-    for (const candidate of candidates) {
-      for (const part of (candidate.content?.parts || [])) {
+    if (flashResp.ok) {
+      const data = await flashResp.json()
+      for (const part of (data.candidates?.[0]?.content?.parts || [])) {
         if (part.inlineData?.mimeType?.startsWith('image/')) {
-          const imageUrl = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`
-          console.log('[render-from-3d] Nano Banana success ✓')
-          return NextResponse.json({ image: imageUrl })
-        }
-        if (part.fileData?.fileUri) {
-          return NextResponse.json({ image: part.fileData.fileUri })
+          return NextResponse.json({ image: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}` })
         }
       }
     }
 
-    console.error('[render-from-3d] No image in response:', JSON.stringify(data).slice(0,300))
-    return NextResponse.json({ error: 'No image returned from Nano Banana' }, { status: 500 })
+    return NextResponse.json({ error: 'Image generation failed' }, { status: 500 })
 
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Render failed'
