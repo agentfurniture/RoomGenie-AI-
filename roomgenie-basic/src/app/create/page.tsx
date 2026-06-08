@@ -1434,7 +1434,26 @@ export default function CreatePage() {
     const d    = result.design
     const dims = result.dimensions
     const lj   = result.layoutJSON
-    const [activeTab, setActiveTab] = useState<'3d'|'plan'>('3d')
+    const [activeTab, setActiveTab] = useState<'photo'|'3d'|'plan'>('photo')
+    const [photoUrl, setPhotoUrl]   = useState<string>(result.image || '')
+    const [rendering, setRendering] = useState(false)
+
+    // Capture 3D SVG → send to Nano Banana → update photo tab
+    async function handleCapture(b64: string) {
+      setRendering(true)
+      setActiveTab('photo')
+      try {
+        const res  = await fetch('/api/render-from-3d', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ image: b64, style, roomType, layoutJSON: result?.layoutJSON }),
+        })
+        const data = await res.json()
+        if (data.image) setPhotoUrl(data.image)
+        else console.error('render-from-3d returned no image:', data)
+      } catch(e) { console.error('render-from-3d error:', e) }
+      finally { setRendering(false) }
+    }
 
     if (!lj) return (
       <div style={{ textAlign:'center', padding:40, color:'#64748b' }}>
@@ -1442,18 +1461,24 @@ export default function CreatePage() {
       </div>
     )
 
+    const TABS = [
+      { id:'photo' as const, icon:'📸', label:'Photo Render',    sub:'Nano Banana AI',       color:'linear-gradient(135deg,#f59e0b,#ef4444)' },
+      { id:'3d'    as const, icon:'3D', label:'3D Room Viewer',  sub:'Rotating · Interactive',color:'linear-gradient(135deg,#4f7cff,#7c3aed)' },
+      { id:'plan'  as const, icon:'2D', label:'Floor Plan',       sub:'Top-down · Linked',    color:'linear-gradient(135deg,#10b981,#059669)' },
+    ]
+
     return (
       <div ref={resultRef} style={{ marginTop:36, borderTop:'2px solid #e0e7ff', paddingTop:32 }}>
 
         {/* Header */}
         <div style={{ textAlign:'center', marginBottom:22 }}>
           <div style={{ display:'inline-flex', alignItems:'center', gap:6, background:'#f0fdf4', border:'1px solid #bbf7d0', borderRadius:100, padding:'5px 16px', fontSize:12, fontWeight:700, color:'#16a34a', marginBottom:10 }}>
-            <span style={{ width:7,height:7,borderRadius:'50%',background:'#16a34a',display:'inline-block' }}/> 2 Views Generated · Linked
+            <span style={{ width:7,height:7,borderRadius:'50%',background:'#16a34a',display:'inline-block' }}/> All Views Linked · 3 Generated
           </div>
-          <h2 style={{ fontSize:24, fontWeight:900, letterSpacing:'-.6px', color:'#0f172a', margin:'0 0 5px' }}>
+          <h2 style={{ fontSize:24, fontWeight:900, letterSpacing:'-.6px', color:'#0f172a', margin:'0 0 4px' }}>
             {d?.title || `${style} ${roomType}`}
           </h2>
-          <p style={{ fontSize:14, color:'#64748b', margin:'0 0 10px' }}>{d?.tagline || 'A beautifully designed space'}</p>
+          <p style={{ fontSize:14, color:'#64748b', margin:'0 0 10px' }}>{d?.tagline || 'A beautifully curated space'}</p>
           {dims && (
             <div style={{ display:'inline-flex', alignItems:'center', gap:5, background:'#eef2ff', border:'1px solid #c7d2fe', borderRadius:100, padding:'4px 14px', fontSize:12, fontWeight:600, color:'#4f7cff' }}>
               📐 {dims.w}×{dims.l}ft · {dims.sqft} sq ft · {dims.h}ft ceiling
@@ -1461,35 +1486,15 @@ export default function CreatePage() {
           )}
         </div>
 
-        {/* Side-by-side badges */}
-        <div style={{ display:'flex', justifyContent:'center', gap:8, marginBottom:18, flexWrap:'wrap' }}>
-          {[
-            ['2','linear-gradient(135deg,#4f7cff,#7c3aed)','3D Room Viewer','Rotating · Draggable'],
-            ['3','linear-gradient(135deg,#10b981,#059669)','Floor Plan','All furniture labelled'],
-          ].map(([n,color,label,sub])=>(
-            <div key={n} style={{ display:'flex', alignItems:'center', gap:8, padding:'7px 14px', background:'white', borderRadius:10, border:'1.5px solid #e8eaf0', fontSize:12, fontWeight:700, color:'#0f172a', boxShadow:'0 1px 4px rgba(0,0,0,.05)' }}>
-              <span style={{ width:22,height:22,borderRadius:6,background:color,color:'white',display:'flex',alignItems:'center',justifyContent:'center',fontSize:11,fontWeight:800,flexShrink:0 }}>{n}</span>
-              <div>
-                <div style={{ fontWeight:700, color:'#0f172a' }}>{label}</div>
-                <div style={{ fontSize:10, color:'#94a3b8', fontWeight:400 }}>{sub}</div>
-              </div>
-              <span style={{ fontSize:10, color:'#16a34a', fontWeight:700, background:'#f0fdf4', border:'1px solid #bbf7d0', borderRadius:20, padding:'2px 7px' }}>Linked</span>
-            </div>
-          ))}
-        </div>
-
-        {/* Tab selector — only 2 tabs */}
-        <div style={{ display:'flex', gap:4, background:'#f1f5f9', borderRadius:12, padding:4, marginBottom:16 }}>
-          {([
-            ['3d','3D','3D Room Viewer','Rotating isometric','linear-gradient(135deg,#4f7cff,#7c3aed)'],
-            ['plan','2D','Floor Plan','All furniture labelled','linear-gradient(135deg,#10b981,#059669)'],
-          ] as const).map(([id,icon,label,sub,color])=>(
+        {/* Tab bar */}
+        <div style={{ display:'flex', gap:4, background:'#f1f5f9', borderRadius:14, padding:4, marginBottom:16 }}>
+          {TABS.map(({ id, icon, label, sub, color }) => (
             <button key={id} onClick={()=>setActiveTab(id)}
-              style={{ flex:1, padding:'12px 8px', background:activeTab===id?'white':'transparent', border:'none', borderRadius:10, cursor:'pointer', fontFamily:'inherit', transition:'all .2s', boxShadow:activeTab===id?'0 2px 10px rgba(0,0,0,.07)':'none' }}>
-              <div style={{ display:'flex', alignItems:'center', justifyContent:'center', gap:8 }}>
-                <div style={{ width:26,height:26,borderRadius:8,background:activeTab===id?color:'#e2e8f0',display:'flex',alignItems:'center',justifyContent:'center',fontSize:11,color:activeTab===id?'white':'#94a3b8',fontWeight:800,transition:'all .2s' }}>{icon}</div>
+              style={{ flex:1, padding:'11px 8px', background:activeTab===id?'white':'transparent', border:'none', borderRadius:11, cursor:'pointer', fontFamily:'inherit', transition:'all .2s', boxShadow:activeTab===id?'0 2px 10px rgba(0,0,0,.07)':'none' }}>
+              <div style={{ display:'flex', alignItems:'center', justifyContent:'center', gap:7 }}>
+                <div style={{ width:26,height:26,borderRadius:8,background:activeTab===id?color:'#e2e8f0',display:'flex',alignItems:'center',justifyContent:'center',fontSize:10,color:activeTab===id?'white':'#94a3b8',fontWeight:800,transition:'all .2s',flexShrink:0 }}>{icon}</div>
                 <div style={{ textAlign:'left' }}>
-                  <div style={{ fontSize:13, fontWeight:700, color:activeTab===id?'#0f172a':'#64748b' }}>{label}</div>
+                  <div style={{ fontSize:12, fontWeight:700, color:activeTab===id?'#0f172a':'#64748b' }}>{label}</div>
                   <div style={{ fontSize:10, color:'#94a3b8' }}>{sub}</div>
                 </div>
               </div>
@@ -1497,15 +1502,63 @@ export default function CreatePage() {
           ))}
         </div>
 
+        {/* ── PHOTO TAB ── */}
+        {activeTab==='photo' && (
+          <div>
+            <div style={{ borderRadius:16, overflow:'hidden', boxShadow:'0 12px 40px rgba(0,0,0,.12)', position:'relative', minHeight:200, background:'#0f172a' }}>
+              {rendering && (
+                <div style={{ position:'absolute',inset:0,background:'rgba(15,23,42,.82)',backdropFilter:'blur(4px)',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',zIndex:10,borderRadius:16 }}>
+                  <div style={{ width:38,height:38,border:'3px solid rgba(245,158,11,.25)',borderTopColor:'#f59e0b',borderRadius:'50%',animation:'spin .8s linear infinite',marginBottom:14 }}/>
+                  <p style={{ fontSize:14,fontWeight:700,color:'white',margin:0 }}>Nano Banana rendering…</p>
+                  <p style={{ fontSize:12,color:'rgba(255,255,255,.5)',marginTop:5 }}>Gemini is making your layout photorealistic</p>
+                </div>
+              )}
+              {photoUrl ? (
+                <img src={photoUrl} alt={`${style} ${roomType}`}
+                  style={{ width:'100%',display:'block',maxHeight:500,objectFit:'cover',opacity:rendering?.35:1,transition:'opacity .3s' }}
+                  onError={e=>{(e.target as HTMLImageElement).src='https://images.unsplash.com/photo-1618219908412-a29a1bb7b86e?w=1200&q=85&auto=format&fit=crop'}}/>
+              ) : (
+                <div style={{ display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:280,color:'#475569',gap:12 }}>
+                  <div style={{ fontSize:36 }}>🎨</div>
+                  <p style={{ fontSize:14,fontWeight:600,margin:0 }}>Photo render not yet generated</p>
+                  <p style={{ fontSize:12,margin:0,color:'#94a3b8' }}>Switch to 3D tab → orbit to your angle → click "📸 Make Photo from This View"</p>
+                </div>
+              )}
+              {photoUrl && !rendering && <>
+                <div style={{ position:'absolute',top:14,left:14,background:'rgba(0,0,0,.62)',backdropFilter:'blur(8px)',borderRadius:9,padding:'5px 12px',fontSize:12,fontWeight:700,color:'white',border:'1px solid rgba(255,255,255,.15)' }}>
+                  📸 Nano Banana Render
+                </div>
+                <div style={{ position:'absolute',top:14,right:14,background:'rgba(245,158,11,.88)',borderRadius:9,padding:'5px 12px',fontSize:11,fontWeight:700,color:'white' }}>
+                  ✦ AI Generated
+                </div>
+                {dims && <div style={{ position:'absolute',bottom:14,left:14,background:'rgba(0,0,0,.6)',backdropFilter:'blur(8px)',borderRadius:8,padding:'4px 12px',fontSize:11,fontWeight:600,color:'white' }}>{dims.w}×{dims.l}ft · {dims.sqft} sq ft</div>}
+              </>}
+            </div>
+            <div style={{ display:'flex',gap:10,marginTop:12 }}>
+              {photoUrl && (
+                <a href={photoUrl} target="_blank" rel="noopener"
+                  style={{ flex:1,display:'flex',alignItems:'center',justifyContent:'center',gap:7,padding:'11px',borderRadius:12,background:'linear-gradient(135deg,#f59e0b,#ef4444)',color:'white',fontWeight:700,fontSize:13,textDecoration:'none' }}>
+                  ⬇ Save Render
+                </a>
+              )}
+              <button onClick={()=>{navigator.clipboard.writeText(window.location.href);setCopied(true);setTimeout(()=>setCopied(false),2000)}}
+                style={{...s.btnSecondary,fontSize:13}}>{copied?'✓ Copied!':'🔗 Share'}</button>
+              <button onClick={()=>{setResult(null);setStep(0);window.scrollTo({top:0,behavior:'smooth'})}}
+                style={{...s.btnSecondary,fontSize:13}}>🔄 Redesign</button>
+            </div>
+            <div style={{ marginTop:10,background:'#f0f4ff',border:'1px solid #c7d2fe',borderRadius:10,padding:'10px 14px',fontSize:12,color:'#4f7cff',lineHeight:1.7 }}>
+              💡 Switch to <strong>3D Room</strong> tab → orbit to your preferred angle → click <strong>📸 Make Photo from This View</strong> to generate a Nano Banana photorealistic render of that exact layout.
+            </div>
+          </div>
+        )}
+
         {/* ── 3D TAB ── */}
         {activeTab==='3d' && (
           <div>
-            <RoomViewer3D layoutJSON={lj} style={style} roomType={roomType}/>
-            {dims && <div style={{ marginTop:6, fontSize:11, color:'#64748b', textAlign:'center' }}>
-              📐 {dims.w}×{dims.l}ft · {dims.sqft} sq ft · {dims.h}ft ceiling
-            </div>}
-            <div style={{ marginTop:10, background:'#f0f4ff', border:'1px solid #c7d2fe', borderRadius:10, padding:'10px 14px', fontSize:12, color:'#4f7cff', lineHeight:1.7 }}>
-              💡 <strong>Pause</strong> to stop rotation · Furniture numbered and colour-coded · Switch to <strong>Floor Plan</strong> for the top-down layout
+            <RoomViewer3D layoutJSON={lj} style={style} roomType={roomType} onCapture={handleCapture}/>
+            {dims && <div style={{ marginTop:6,fontSize:11,color:'#64748b',textAlign:'center' }}>📐 {dims.w}×{dims.l}ft · {dims.sqft} sq ft · {dims.h}ft ceiling</div>}
+            <div style={{ marginTop:10,background:'#f0f4ff',border:'1px solid #c7d2fe',borderRadius:10,padding:'10px 14px',fontSize:12,color:'#4f7cff',lineHeight:1.7 }}>
+              💡 <strong>Pause</strong> to stop rotation · Click <strong>📸 Make Photo from This View</strong> to send this exact layout to Nano Banana
             </div>
           </div>
         )}
@@ -1514,76 +1567,72 @@ export default function CreatePage() {
         {activeTab==='plan' && (
           <div>
             <FloorPlan2D layoutJSON={lj} style={style} roomType={roomType}/>
-            <div style={{ marginTop:10, background:'#f0fdf4', border:'1px solid #bbf7d0', borderRadius:10, padding:'10px 14px', fontSize:12, color:'#166534', lineHeight:1.7 }}>
-              💡 Every piece of furniture is numbered and colour-coded to match the <strong>3D Viewer</strong> legend. Dimensions shown to scale.
+            <div style={{ marginTop:10,background:'#f0fdf4',border:'1px solid #bbf7d0',borderRadius:10,padding:'10px 14px',fontSize:12,color:'#166534',lineHeight:1.7 }}>
+              💡 Numbered furniture matches the <strong>3D Viewer</strong> legend exactly. Same layout data drives all 3 views.
             </div>
           </div>
         )}
 
-        {/* Description */}
+        {/* Design description */}
         {d?.description && (
-          <div style={{ marginTop:16, background:'#f8faff', border:'1px solid #e0e7ff', borderRadius:14, padding:'16px 20px' }}>
-            <p style={{ fontSize:14, color:'#374151', lineHeight:1.8, margin:0 }}>{d.description}</p>
-            {d.spatialNote && <p style={{ fontSize:13, color:'#4f7cff', lineHeight:1.7, margin:'10px 0 0', fontStyle:'italic', borderTop:'1px solid #e0e7ff', paddingTop:10 }}>📐 {d.spatialNote}</p>}
+          <div style={{ marginTop:16,background:'#f8faff',border:'1px solid #e0e7ff',borderRadius:14,padding:'16px 20px' }}>
+            <p style={{ fontSize:14,color:'#374151',lineHeight:1.8,margin:0 }}>{d.description}</p>
+            {d.spatialNote && <p style={{ fontSize:13,color:'#4f7cff',lineHeight:1.7,margin:'10px 0 0',fontStyle:'italic',borderTop:'1px solid #e0e7ff',paddingTop:10 }}>📐 {d.spatialNote}</p>}
           </div>
         )}
 
         {/* Details grid */}
-        <div style={{ display:'grid', gridTemplateColumns:'repeat(3,1fr)', gap:12, marginTop:14 }}>
+        <div style={{ display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:12,marginTop:14 }}>
           {d?.colors && (d.colors as string[]).length>0 && (
-            <div style={{ background:'white', border:'1px solid #e8eaf0', borderRadius:12, padding:14 }}>
-              <h4 style={{ fontSize:10, fontWeight:700, color:'#94a3b8', textTransform:'uppercase', letterSpacing:'1px', margin:'0 0 10px' }}>Palette</h4>
+            <div style={{ background:'white',border:'1px solid #e8eaf0',borderRadius:12,padding:14 }}>
+              <h4 style={{ fontSize:10,fontWeight:700,color:'#94a3b8',textTransform:'uppercase',letterSpacing:'1px',margin:'0 0 10px' }}>Palette</h4>
               {(d.colors as string[]).map((c,i)=>{
                 const[hex,name]=c.includes(' - ')?c.split(' - '):[c,c]
-                return<div key={i} style={{ display:'flex', alignItems:'center', gap:7, marginBottom:7 }}>
+                return<div key={i} style={{ display:'flex',alignItems:'center',gap:7,marginBottom:7 }}>
                   <div style={{ width:20,height:20,borderRadius:5,background:hex.startsWith('#')?hex:'#e2e8f0',border:'1px solid rgba(0,0,0,.08)',flexShrink:0 }}/>
-                  <span style={{ fontSize:11, color:'#374151' }}>{name}</span>
+                  <span style={{ fontSize:11,color:'#374151' }}>{name}</span>
                 </div>
               })}
             </div>
           )}
           {d?.materials && (d.materials as string[]).length>0 && (
-            <div style={{ background:'white', border:'1px solid #e8eaf0', borderRadius:12, padding:14 }}>
-              <h4 style={{ fontSize:10, fontWeight:700, color:'#94a3b8', textTransform:'uppercase', letterSpacing:'1px', margin:'0 0 10px' }}>Materials</h4>
-              <div style={{ display:'flex', flexWrap:'wrap', gap:5 }}>
-                {(d.materials as string[]).map((m,i)=><span key={i} style={{ background:'#f0f4ff', border:'1px solid #c7d2fe', borderRadius:20, padding:'3px 9px', fontSize:10, fontWeight:600, color:'#4f7cff' }}>{m}</span>)}
+            <div style={{ background:'white',border:'1px solid #e8eaf0',borderRadius:12,padding:14 }}>
+              <h4 style={{ fontSize:10,fontWeight:700,color:'#94a3b8',textTransform:'uppercase',letterSpacing:'1px',margin:'0 0 10px' }}>Materials</h4>
+              <div style={{ display:'flex',flexWrap:'wrap',gap:5 }}>
+                {(d.materials as string[]).map((m,i)=><span key={i} style={{ background:'#f0f4ff',border:'1px solid #c7d2fe',borderRadius:20,padding:'3px 9px',fontSize:10,fontWeight:600,color:'#4f7cff' }}>{m}</span>)}
               </div>
             </div>
           )}
-          <div style={{ background:'white', border:'1px solid #e8eaf0', borderRadius:12, padding:14 }}>
-            <h4 style={{ fontSize:10, fontWeight:700, color:'#94a3b8', textTransform:'uppercase', letterSpacing:'1px', margin:'0 0 10px' }}>Design Brief</h4>
-            {[['Style',style],['Room',roomType],['Size',dims?`${dims.w}×${dims.l}ft`:'—'],['Ceiling',dims?.h?`${dims.h}ft`:'—'],['AI','Claude']].map(([l,v])=>(
-              <div key={l} style={{ display:'flex', justifyContent:'space-between', fontSize:11, padding:'4px 0', borderBottom:'1px solid #f8faff' }}>
+          <div style={{ background:'white',border:'1px solid #e8eaf0',borderRadius:12,padding:14 }}>
+            <h4 style={{ fontSize:10,fontWeight:700,color:'#94a3b8',textTransform:'uppercase',letterSpacing:'1px',margin:'0 0 10px' }}>Design Brief</h4>
+            {[['Style',style],['Room',roomType],['Size',dims?`${dims.w}×${dims.l}ft`:'—'],['Ceiling',dims?.h?`${dims.h}ft`:'—'],['AI','Claude + Nano Banana']].map(([l,v])=>(
+              <div key={l} style={{ display:'flex',justifyContent:'space-between',fontSize:11,padding:'4px 0',borderBottom:'1px solid #f8faff' }}>
                 <span style={{ color:'#94a3b8' }}>{l}</span>
-                <span style={{ color:'#0f172a', fontWeight:700 }}>{v}</span>
+                <span style={{ color:'#0f172a',fontWeight:700 }}>{v}</span>
               </div>
             ))}
           </div>
         </div>
 
         {d?.tips && (d.tips as string[]).length>0 && (
-          <div style={{ background:'white', border:'1px solid #e8eaf0', borderRadius:12, padding:14, marginTop:12 }}>
-            <h4 style={{ fontSize:10, fontWeight:700, color:'#94a3b8', textTransform:'uppercase', letterSpacing:'1px', margin:'0 0 10px' }}>Designer Tips</h4>
-            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:8 }}>
-              {(d.tips as string[]).map((t,i)=><div key={i} style={{ fontSize:12, color:'#374151', display:'flex', gap:7, lineHeight:1.6 }}><span style={{ color:'#16a34a', fontWeight:800, flexShrink:0 }}>✓</span>{t}</div>)}
+          <div style={{ background:'white',border:'1px solid #e8eaf0',borderRadius:12,padding:14,marginTop:12 }}>
+            <h4 style={{ fontSize:10,fontWeight:700,color:'#94a3b8',textTransform:'uppercase',letterSpacing:'1px',margin:'0 0 10px' }}>Designer Tips</h4>
+            <div style={{ display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:8 }}>
+              {(d.tips as string[]).map((t,i)=><div key={i} style={{ fontSize:12,color:'#374151',display:'flex',gap:7,lineHeight:1.6 }}><span style={{ color:'#16a34a',fontWeight:800,flexShrink:0 }}>✓</span>{t}</div>)}
             </div>
           </div>
         )}
 
-        {/* Actions */}
-        <div style={{ display:'flex', gap:10, marginTop:16, flexWrap:'wrap' }}>
+        <div style={{ display:'flex',gap:10,marginTop:16,flexWrap:'wrap' }}>
           <button onClick={()=>{navigator.clipboard.writeText(window.location.href);setCopied(true);setTimeout(()=>setCopied(false),2000)}}
-            style={{...s.btnSecondary}}>
-            {copied?'✓ Copied!':'🔗 Share'}
-          </button>
+            style={s.btnSecondary}>{copied?'✓ Copied!':'🔗 Share'}</button>
           <button onClick={()=>{setResult(null);setStep(0);window.scrollTo({top:0,behavior:'smooth'})}}
-            style={{ ...s.btnPrimary, flex:1, justifyContent:'center' }}>
-            ✦ Generate New Design
-          </button>
+            style={{ ...s.btnPrimary,flex:1,justifyContent:'center' }}>✦ Generate New Design</button>
         </div>
       </div>
     )
   }
+
 
 
 
