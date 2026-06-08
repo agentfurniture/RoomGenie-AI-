@@ -249,90 +249,115 @@ async function analyzeImages(
 // ─── STAGE 2: LAYOUT PLANNING ─────────────────────────────────────────────────
 
 async function planLayout(
-  anthropic:       import('@anthropic-ai/sdk').default,
-  style:           string,
-  roomType:        string,
-  dims:            RoomDimensions,
-  answers:         Record<string, string>,
-  custom:          string,
-  roomContext:     string,
+  anthropic:        import('@anthropic-ai/sdk').default,
+  style:            string,
+  roomType:         string,
+  dims:             RoomDimensions,
+  answers:          Record<string, string>,
+  custom:           string,
+  roomContext:      string,
   furnitureContext: string
 ): Promise<RoomLayoutJSON> {
   const styleKw = STYLE_KEYWORDS[style] || style
 
   const userContext = [
     `Style: ${style}. Room: ${roomType}.`,
-    `Exact dimensions: ${dims.widthFt}ft wide × ${dims.lengthFt}ft long × ${dims.heightFt}ft ceiling. Total: ${dims.sqft} sqft.`,
-    answers.mood     ? `Mood: ${answers.mood}.`         : '',
-    answers.budget   ? `Budget: ${answers.budget}.`     : '',
-    answers.lighting ? `Lighting: ${answers.lighting}.` : '',
-    answers.material ? `Materials preference: ${answers.material}.` : '',
-    custom           ? `Client notes: ${custom}.`       : '',
-    roomContext      ? `Existing room: ${roomContext}`   : '',
-    furnitureContext  ? `Furniture to PRESERVE in new design: ${furnitureContext}` : '',
+    `Room dimensions: ${dims.widthFt}ft wide × ${dims.lengthFt}ft long × ${dims.heightFt}ft ceiling (${dims.sqft} sqft).`,
+    answers.mood     ? `Desired mood: ${answers.mood}.`              : '',
+    answers.budget   ? `Budget: ${answers.budget}.`                  : '',
+    answers.lighting ? `Lighting: ${answers.lighting}.`              : '',
+    answers.material ? `Materials: ${answers.material}.`             : '',
+    custom           ? `CLIENT REQUEST: "${custom}"` : '',
+    roomContext      ? `Existing room: ${roomContext}`                : '',
+    furnitureContext ? `Preserve this furniture: ${furnitureContext}` : '',
   ].filter(Boolean).join('\n')
 
   const resp = await anthropic.messages.create({
-    model:      'claude-haiku-4-5-20251001',
-    max_tokens: 2500,
-    system: `You are an expert interior designer and spatial planner.
-Generate PRECISE room layout JSON where ALL furniture positions and sizes are fractions of the room (0.0-1.0).
-- xFrac=0 is LEFT wall, xFrac=1 is RIGHT wall
-- yFrac=0 is FAR wall (back), yFrac=1 is NEAR wall (front/viewer)
-- wFrac = furniture width as fraction of room width
-- dFrac = furniture depth as fraction of room length
-- Ensure NO furniture overlaps. Maintain 3ft walkways (0.18 fraction at minimum).
-- Scale furniture REALISTICALLY: a sofa in a ${dims.sqft} sqft ${roomType} should be proportional.
-- If furniture to preserve is mentioned, include it with preserved:true.
-Respond ONLY with valid JSON. No markdown. No explanation.`,
+    model:      'claude-sonnet-4-5',
+    max_tokens: 4000,
+    system: `You are a world-class interior designer. Generate a UNIQUE layout that reflects EXACTLY what the client asked for.
+RULES:
+- Read the client request carefully. Every word matters.
+- Choose furniture, colors, and labels that DIRECTLY reflect their request.
+- Kids room = bright colors, playful labels. Luxury = gold/cream/velvet. Minimalist = white/grey/clean.
+- Labels must be SPECIFIC: "Rainbow Toy Shelf", "Princess Canopy Bed", not "Shelf", "Bed"
+- Colors must match the mood. Use varied, realistic hex values.
+- All positions are 0.0-1.0 fractions. xFrac=0=LEFT, yFrac=0=FAR wall.
+- No overlaps. 3ft (≈0.2 fraction) walkways between pieces.
+- Include 6-10 furniture pieces appropriate for the room and request.
+- Scale correctly: in ${dims.sqft} sqft, a bed is wFrac≈${Math.min(0.55, 6.5/dims.widthFt).toFixed(2)}, dFrac≈${Math.min(0.42, 6.5/dims.lengthFt).toFixed(2)}.
+Respond ONLY with valid JSON. No markdown.`,
     messages: [{
       role: 'user',
       content: `${userContext}
 
-Generate complete room layout JSON:
+Return this exact JSON structure with values that match the client's request:
 {
   "roomId": "r${Date.now()}",
   "roomType": "${roomType}",
   "style": "${style}",
   "dimensions": {"widthFt":${dims.widthFt},"lengthFt":${dims.lengthFt},"heightFt":${dims.heightFt},"sqft":${dims.sqft}},
-  "floor": {"material":"string","color":"#hex","pattern":"optional"},
-  "walls": {"color":"#hex","material":"string","accentWall":"optional"},
-  "ceiling": {"color":"#hex","heightFt":${dims.heightFt},"feature":"optional"},
-  "furniture": [{"id":"f1","type":"sofa|bed|etc","label":"Display Name","color":"#hex","material":"string","xFrac":0.0,"yFrac":0.0,"wFrac":0.0,"dFrac":0.0,"heightFt":0.0,"rotation":0,"preserved":false,"notes":"placement reason"}],
-  "lighting": {"ambient":"string","accent":"string","natural":"string"},
+  "floor": {"material":"hardwood|carpet|tile|marble","color":"#hex","pattern":"plank|herringbone|tile|none"},
+  "walls": {"color":"#hex","material":"paint|plaster|wallpaper","accentWall":"describe or null"},
+  "ceiling": {"color":"#hex","heightFt":${dims.heightFt},"feature":"crown moulding|plain|beams"},
+  "furniture": [
+    {"id":"f1","type":"bed|sofa|desk|wardrobe|shelving|rug|floor_lamp|etc",
+     "label":"SPECIFIC name matching request",
+     "color":"#hex matching style and request",
+     "material":"fabric|wood|metal|velvet|etc",
+     "xFrac":0.0,"yFrac":0.0,"wFrac":0.0,"dFrac":0.0,"heightFt":0.0,
+     "rotation":0,"preserved":false,"notes":"why this piece and position"}
+  ],
+  "lighting": {"ambient":"describe","accent":"describe","natural":"describe"},
   "palette": {"primary":"#hex","secondary":"#hex","accent":"#hex","neutral":"#hex"},
   "styleDetails": "${styleKw}",
-  "mood": "${answers.mood || 'balanced'}",
-  "designRationale": "2 sentences on layout decisions",
-  "spatialNotes": "1 sentence on how dimensions shaped design",
-  "title": "Creative design title",
-  "tagline": "One poetic sentence",
-  "description": "3 sentences describing atmosphere and materials",
+  "mood": "${answers.mood || custom || 'balanced and inviting'}",
+  "designRationale": "2 sentences on how this reflects the client request",
+  "spatialNotes": "How ${dims.sqft} sqft shaped the layout",
+  "title": "Evocative title capturing the specific design",
+  "tagline": "One sentence description",
+  "description": "3 sentences on atmosphere, materials, and how it fulfills the request",
   "colors": ["#hex - Name","#hex - Name","#hex - Name","#hex - Name"],
-  "tips": ["Specific design tip 1","Tip 2","Tip 3"],
+  "tips": ["Specific tip for this design","Tip 2","Tip 3"],
   "materials": ["Material 1","Material 2","Material 3"]
 }`
     }]
   })
 
-  const text = resp.content[0].type === 'text' ? resp.content[0].text : ''
+  const raw = resp.content[0].type === 'text' ? resp.content[0].text : ''
+  const jsonMatch = raw.replace(/```json?\n?/g,'').replace(/```\n?/g,'').trim().match(/\{[\s\S]*\}/)
+  const parsed = jsonMatch ? jsonMatch[0] : ''
+
   try {
-    const layout = JSON.parse(text.replace(/```json?\n?/g, '').replace(/```\n?/g, '').trim()) as RoomLayoutJSON
-    // Ensure dimensions are always the user-provided values
+    const layout = JSON.parse(parsed) as RoomLayoutJSON
     layout.dimensions = dims
+    console.log(`[Layout] "${layout.title}" — ${layout.furniture?.length || 0} pieces`)
     return layout
   } catch (e) {
-    console.error('[Layout] Parse failed, using defaults:', e)
+    console.error('[Layout] Parse failed:', (e as Error).message, raw.slice(0, 200))
+    // Style-aware fallback
     const fallback = getDefaultLayout(roomType, style, dims, answers)
-    fallback.title       = `${style} ${roomType}`
-    fallback.tagline     = 'A beautifully curated space.'
-    fallback.description = `A stunning ${style} ${roomType} designed for ${dims.sqft} sqft.`
-    fallback.colors      = ['#F5F5F0 - Warm White','#D4C5A9 - Sand','#8B7355 - Taupe','#2C2C2C - Charcoal']
-    fallback.tips        = ['Layer your lighting','Mix textures for depth','Maintain consistent palette']
-    fallback.materials   = ['Premium linen','Natural oak','Brushed brass']
+    const styleColorMap: Record<string, string[]> = {
+      'Modern':        ['#F5F5F0 - Warm White','#2C2C2C - Charcoal','#8B8680 - Warm Grey','#C4A882 - Sand'],
+      'Luxury':        ['#F5EDD8 - Champagne','#C9A84C - Antique Gold','#1A1A2E - Midnight','#8B7355 - Cognac'],
+      'Minimalist':    ['#FFFFFF - Pure White','#F0F0F0 - Off White','#2C2C2C - Charcoal','#E8E8E8 - Pearl'],
+      'Scandinavian':  ['#FFFFFF - Nordic White','#D4BC94 - Pine','#4A6741 - Forest','#C8B898 - Birch'],
+      'Industrial':    ['#2C2C2C - Iron','#B5A898 - Raw Plaster','#8B6030 - Reclaimed','#6B6B6B - Steel'],
+      'Bohemian':      ['#C87040 - Terracotta','#D4A050 - Amber','#5C8A50 - Jungle','#9B4444 - Burgundy'],
+      'Japandi':       ['#F2EDE5 - Washi','#C8AA80 - Bamboo','#5C4830 - Walnut','#8BA888 - Sage'],
+      'Classic':       ['#F5F0E8 - Ivory','#C9A84C - Gold','#8B2020 - Crimson','#2C1810 - Mahogany'],
+      'Kids Room':     ['#FF9EAF - Bubblegum','#87CEEB - Sky Blue','#98FB98 - Mint Green','#FFD700 - Sunshine'],
+    }
+    fallback.title       = custom ? custom.split(' ').slice(0,6).map(w=>w.charAt(0).toUpperCase()+w.slice(1)).join(' ') : `${style} ${roomType}`
+    fallback.tagline     = `A uniquely crafted ${style.toLowerCase()} ${roomType.toLowerCase()}.`
+    fallback.description = `This ${style.toLowerCase()} ${roomType.toLowerCase()} ${custom ? 'features ' + custom.slice(0,80) + '. ' : ''}The ${dims.sqft} sqft space is designed for both beauty and function. ${answers.mood ? 'The ' + answers.mood + ' atmosphere flows through every detail.' : ''}`
+    fallback.colors      = styleColorMap[style] || styleColorMap['Modern']
+    fallback.tips        = [`Layer ${style.toLowerCase()} lighting for depth`, `Mix textures to add warmth`, `The ${dims.widthFt}×${dims.lengthFt}ft layout allows for a clear focal point`]
+    fallback.materials   = { 'Luxury':['Italian marble','Brushed brass','Hand-stitched velvet'], 'Scandinavian':['Light pine','Natural linen','Sheepskin'], 'Industrial':['Reclaimed wood','Black steel','Raw concrete'], 'Bohemian':['Rattan','Cotton macramé','Persian wool'] }[style] || ['Premium fabric','Natural oak','Brushed metal']
     return fallback
   }
 }
+
 
 // ─── STAGE 3: SVG FLOOR PLAN ──────────────────────────────────────────────────
 
