@@ -505,103 +505,180 @@ function buildRenderPrompt(layout: RoomLayoutJSON): { prompt: string; negative: 
   return { prompt, negative }
 }
 
-// ─── STAGE 5: REPLICATE IMAGE GENERATION ─────────────────────────────────────
 
-async function generateImage(prompt: string): Promise<string | null> {
-  const apiKey = process.env.OPENAI_API_KEY
-  if (!apiKey) { console.log('[OpenAI] No API key'); return null }
+// ─── STAGE 5: NANO BANANA PRO (Google Gemini Image Generation) ───────────────
+//
+// Nano Banana = Google's codename for Gemini native image generation
+// Models available via Google AI Studio / Gemini API:
+//   gemini-2.5-flash-image   = Nano Banana       (fast, cheap)
+//   gemini-3-pro-image       = Nano Banana Pro    (best quality, spatial reasoning)
+//   gemini-3.1-flash-image   = Nano Banana 2      (high-volume)
+//
+// We use gemini-2.5-flash-image (Nano Banana) as primary — fastest and most cost-effective
+// Falls back to Nano Banana Pro for a retry if needed
+// Set GEMINI_API_KEY in Vercel environment variables (from Google AI Studio)
+
+async function generateWithNanoBanana(
+  prompt: string,
+  model: 'gemini-2.5-flash-image' | 'gemini-3-pro-image' | 'gemini-3.1-flash-image' = 'gemini-2.5-flash-image'
+): Promise<string | null> {
+  const apiKey = process.env.GEMINI_API_KEY
+  if (!apiKey) { console.log('[NanoBanana] No GEMINI_API_KEY set'); return null }
 
   try {
-    const OpenAI = (await import('openai')).default
-    const openai = new OpenAI({ apiKey })
+    console.log(`[NanoBanana] Generating with ${model}...`)
 
-    console.log('[OpenAI] Generating with gpt-image-1...')
-    const response = await openai.images.generate({
-      model:   'gpt-image-1',
-      prompt:  prompt.slice(0, 4000),
-      size:    '1536x1024' as '1024x1024',
-      quality: 'high' as 'standard',
-      n:       1,
+    // Gemini API image generation endpoint
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`
+
+    const body = {
+      contents: [{
+        parts: [{
+          text: prompt
+        }]
+      }],
+      generationConfig: {
+        responseModalities: ['IMAGE', 'TEXT'],
+        // Nano Banana Pro supports higher resolution
+        ...(model === 'gemini-3-pro-image' ? {} : {}),
+      }
+    }
+
+    const resp = await fetch(url, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(body),
     })
 
-    const item = response.data?.[0]
-    if (!item) return null
-    if (item.b64_json) return `data:image/png;base64,${item.b64_json}`
-    if (item.url)      return item.url
+    if (!resp.ok) {
+      const err = await resp.text()
+      console.error(`[NanoBanana] ${model} error ${resp.status}:`, err.slice(0, 200))
+      return null
+    }
+
+    const data = await resp.json()
+
+    // Extract image from response parts
+    const candidates = data.candidates || []
+    for (const candidate of candidates) {
+      const parts = candidate.content?.parts || []
+      for (const part of parts) {
+        if (part.inlineData?.mimeType?.startsWith('image/')) {
+          const b64 = part.inlineData.data
+          const mime = part.inlineData.mimeType
+          console.log(`[NanoBanana] ${model} success ✓`)
+          return `data:${mime};base64,${b64}`
+        }
+        // Some models return a URL
+        if (part.fileData?.fileUri) {
+          console.log(`[NanoBanana] ${model} fileUri success ✓`)
+          return part.fileData.fileUri
+        }
+      }
+    }
+
+    console.error('[NanoBanana] No image in response:', JSON.stringify(data).slice(0, 300))
     return null
+
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err)
-    console.error('[OpenAI] Error:', msg)
+    console.error('[NanoBanana] Exception:', msg)
     return null
   }
 }
 
-// Curated direct Unsplash images — keyed by "Style-RoomType"
-// These are guaranteed correct room type images, used when Replicate fails
+// Edit an existing image using Nano Banana Pro's image editing capability
+// Used by render-from-3d to make the 3D SVG photorealistic
+async function editWithNanaBanana(
+  imageBase64: string,
+  imageMime: string,
+  prompt: string
+): Promise<string | null> {
+  const apiKey = process.env.GEMINI_API_KEY
+  if (!apiKey) { console.log('[NanaBanana Edit] No GEMINI_API_KEY'); return null }
+
+  try {
+    console.log('[NanaBanana Edit] Editing image with gemini-2.5-flash-image...')
+
+    // Use the conversational image edit endpoint (multimodal input)
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${apiKey}`
+
+    const body = {
+      contents: [{
+        parts: [
+          {
+            inlineData: {
+              mimeType: imageMime,
+              data:     imageBase64,
+            }
+          },
+          { text: prompt }
+        ]
+      }],
+      generationConfig: {
+        responseModalities: ['IMAGE', 'TEXT'],
+      }
+    }
+
+    const resp = await fetch(url, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(body),
+    })
+
+    if (!resp.ok) {
+      console.error('[NanaBanana Edit] Error:', resp.status, await resp.text().then(t=>t.slice(0,200)))
+      return null
+    }
+
+    const data = await resp.json()
+    const candidates = data.candidates || []
+    for (const candidate of candidates) {
+      for (const part of (candidate.content?.parts || [])) {
+        if (part.inlineData?.mimeType?.startsWith('image/')) {
+          console.log('[NanaBanana Edit] Success ✓')
+          return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`
+        }
+      }
+    }
+    return null
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.error('[NanaBanana Edit] Exception:', msg)
+    return null
+  }
+}
+
+// Curated Unsplash fallbacks — used only if Nano Banana fails entirely
 const FALLBACK_IMAGES: Record<string, string> = {
-  // Modern
-  'Modern-Living Room':   'https://images.unsplash.com/photo-1583847268964-b28dc8f51f92?w=1400&q=90&auto=format&fit=crop',
-  'Modern-Bedroom':       'https://images.unsplash.com/photo-1616594039964-ae9021a400a0?w=1400&q=90&auto=format&fit=crop',
-  'Modern-Kitchen':       'https://images.unsplash.com/photo-1556909114-f6e7ad7d3136?w=1400&q=90&auto=format&fit=crop',
-  'Modern-Bathroom':      'https://images.unsplash.com/photo-1552321554-5fefe8c9ef14?w=1400&q=90&auto=format&fit=crop',
-  'Modern-Home Office':   'https://images.unsplash.com/photo-1593642632559-0c6d3fc62b89?w=1400&q=90&auto=format&fit=crop',
-  'Modern-Dining Room':   'https://images.unsplash.com/photo-1615529162924-f8605388461d?w=1400&q=90&auto=format&fit=crop',
-  // Luxury
-  'Luxury-Living Room':   'https://images.unsplash.com/photo-1618219908412-a29a1bb7b86e?w=1400&q=90&auto=format&fit=crop',
-  'Luxury-Bedroom':       'https://images.unsplash.com/photo-1631049307264-da0ec9d70304?w=1400&q=90&auto=format&fit=crop',
-  'Luxury-Bathroom':      'https://images.unsplash.com/photo-1600566752355-35792bedcfea?w=1400&q=90&auto=format&fit=crop',
-  'Luxury-Dining Room':   'https://images.unsplash.com/photo-1615529328331-f8917597711f?w=1400&q=90&auto=format&fit=crop',
-  'Luxury-Kitchen':       'https://images.unsplash.com/photo-1556909172-54557c7e4fb7?w=1400&q=90&auto=format&fit=crop',
-  // Minimalist
-  'Minimalist-Living Room':'https://images.unsplash.com/photo-1598928506311-c55ded91a20c?w=1400&q=90&auto=format&fit=crop',
-  'Minimalist-Bedroom':   'https://images.unsplash.com/photo-1540518614846-7eded433c457?w=1400&q=90&auto=format&fit=crop',
-  'Minimalist-Kitchen':   'https://images.unsplash.com/photo-1556909172-54557c7e4fb7?w=1400&q=90&auto=format&fit=crop',
-  'Minimalist-Bathroom':  'https://images.unsplash.com/photo-1552321554-5fefe8c9ef14?w=1400&q=90&auto=format&fit=crop',
-  // Scandinavian
+  'Modern-Living Room':    'https://images.unsplash.com/photo-1583847268964-b28dc8f51f92?w=1400&q=90&auto=format&fit=crop',
+  'Modern-Bedroom':        'https://images.unsplash.com/photo-1616594039964-ae9021a400a0?w=1400&q=90&auto=format&fit=crop',
+  'Modern-Kitchen':        'https://images.unsplash.com/photo-1556909114-f6e7ad7d3136?w=1400&q=90&auto=format&fit=crop',
+  'Modern-Bathroom':       'https://images.unsplash.com/photo-1552321554-5fefe8c9ef14?w=1400&q=90&auto=format&fit=crop',
+  'Luxury-Living Room':    'https://images.unsplash.com/photo-1618219908412-a29a1bb7b86e?w=1400&q=90&auto=format&fit=crop',
+  'Luxury-Bedroom':        'https://images.unsplash.com/photo-1631049307264-da0ec9d70304?w=1400&q=90&auto=format&fit=crop',
+  'Luxury-Bathroom':       'https://images.unsplash.com/photo-1600566752355-35792bedcfea?w=1400&q=90&auto=format&fit=crop',
   'Scandinavian-Living Room':'https://images.unsplash.com/photo-1586023492125-27b2c045efd7?w=1400&q=90&auto=format&fit=crop',
-  'Scandinavian-Bedroom': 'https://images.unsplash.com/photo-1523741543316-beb7fc7023d8?w=1400&q=90&auto=format&fit=crop',
-  'Scandinavian-Kitchen': 'https://images.unsplash.com/photo-1556909114-f6e7ad7d3136?w=1400&q=90&auto=format&fit=crop',
-  // Industrial
+  'Scandinavian-Bedroom':  'https://images.unsplash.com/photo-1523741543316-beb7fc7023d8?w=1400&q=90&auto=format&fit=crop',
   'Industrial-Living Room':'https://images.unsplash.com/photo-1565183997392-2f6f122e5912?w=1400&q=90&auto=format&fit=crop',
-  'Industrial-Home Office':'https://images.unsplash.com/photo-1497366216548-37526070297c?w=1400&q=90&auto=format&fit=crop',
-  'Industrial-Bedroom':   'https://images.unsplash.com/photo-1505693416388-ac5ce068fe85?w=1400&q=90&auto=format&fit=crop',
-  // Bohemian
-  'Bohemian-Living Room': 'https://images.unsplash.com/photo-1522444195799-478538b28823?w=1400&q=90&auto=format&fit=crop',
-  'Bohemian-Bedroom':     'https://images.unsplash.com/photo-1617325247661-675ab4b64ae2?w=1400&q=90&auto=format&fit=crop',
-  // Japandi
-  'Japandi-Living Room':  'https://images.unsplash.com/photo-1526057565006-20beab8dd2ed?w=1400&q=90&auto=format&fit=crop',
-  'Japandi-Bedroom':      'https://images.unsplash.com/photo-1617806118233-18e1de247200?w=1400&q=90&auto=format&fit=crop',
-  'Japandi-Bathroom':     'https://images.unsplash.com/photo-1600585154340-be6161a56a0c?w=1400&q=90&auto=format&fit=crop',
-  // Classic
-  'Classic-Living Room':  'https://images.unsplash.com/photo-1560448075-bb485b067938?w=1400&q=90&auto=format&fit=crop',
-  'Classic-Bedroom':      'https://images.unsplash.com/photo-1631049307264-da0ec9d70304?w=1400&q=90&auto=format&fit=crop',
-  'Classic-Dining Room':  'https://images.unsplash.com/photo-1615529162924-f8605388461d?w=1400&q=90&auto=format&fit=crop',
-  // Contemporary
-  'Contemporary-Living Room':'https://images.unsplash.com/photo-1600210492486-724fe5c67fb3?w=1400&q=90&auto=format&fit=crop',
-  'Contemporary-Bedroom': 'https://images.unsplash.com/photo-1616594039964-ae9021a400a0?w=1400&q=90&auto=format&fit=crop',
-  // Mediterranean
-  'Mediterranean-Living Room':'https://images.unsplash.com/photo-1558618666-fcd25c85cd64?w=1400&q=90&auto=format&fit=crop',
-  'Mediterranean-Bedroom':'https://images.unsplash.com/photo-1560448075-bb485b067938?w=1400&q=90&auto=format&fit=crop',
-  // Kids / Suite / Studio
-  'Kids Room':            'https://images.unsplash.com/photo-1598300042247-d088f8ab3a91?w=1400&q=90&auto=format&fit=crop',
-  'Master Suite':         'https://images.unsplash.com/photo-1631049307264-da0ec9d70304?w=1400&q=90&auto=format&fit=crop',
-  'Studio':               'https://images.unsplash.com/photo-1598928506311-c55ded91a20c?w=1400&q=90&auto=format&fit=crop',
+  'Bohemian-Living Room':  'https://images.unsplash.com/photo-1522444195799-478538b28823?w=1400&q=90&auto=format&fit=crop',
+  'Japandi-Bedroom':       'https://images.unsplash.com/photo-1617806118233-18e1de247200?w=1400&q=90&auto=format&fit=crop',
+  'Classic-Living Room':   'https://images.unsplash.com/photo-1560448075-bb485b067938?w=1400&q=90&auto=format&fit=crop',
+  'Classic-Bedroom':       'https://images.unsplash.com/photo-1631049307264-da0ec9d70304?w=1400&q=90&auto=format&fit=crop',
+  'Kids Room':             'https://images.unsplash.com/photo-1598300042247-d088f8ab3a91?w=1400&q=90&auto=format&fit=crop',
+  'Master Suite':          'https://images.unsplash.com/photo-1631049307264-da0ec9d70304?w=1400&q=90&auto=format&fit=crop',
+  'Bathroom':              'https://images.unsplash.com/photo-1552321554-5fefe8c9ef14?w=1400&q=90&auto=format&fit=crop',
+  'Kitchen':               'https://images.unsplash.com/photo-1556909114-f6e7ad7d3136?w=1400&q=90&auto=format&fit=crop',
+  'Home Office':           'https://images.unsplash.com/photo-1593642632559-0c6d3fc62b89?w=1400&q=90&auto=format&fit=crop',
+  'Dining Room':           'https://images.unsplash.com/photo-1615529162924-f8605388461d?w=1400&q=90&auto=format&fit=crop',
 }
 
 function getFallbackImage(style: string, roomType: string): string {
-  // Try exact style+room match first
-  const key1 = `${style}-${roomType}`
-  if (FALLBACK_IMAGES[key1]) return FALLBACK_IMAGES[key1]
-  // Try just room type (any style)
-  const key2 = Object.keys(FALLBACK_IMAGES).find(k => k.endsWith(`-${roomType}`))
-  if (key2) return FALLBACK_IMAGES[key2]
-  // Try just room type without style prefix
-  if (FALLBACK_IMAGES[roomType]) return FALLBACK_IMAGES[roomType]
-  // Ultimate fallback — always a living room, never random
-  return 'https://images.unsplash.com/photo-1618219908412-a29a1bb7b86e?w=1400&q=90&auto=format&fit=crop'
+  return FALLBACK_IMAGES[`${style}-${roomType}`]
+    || FALLBACK_IMAGES[roomType]
+    || Object.values(FALLBACK_IMAGES).find((_,i,a)=> Object.keys(FALLBACK_IMAGES)[i].endsWith(`-${roomType}`))
+    || 'https://images.unsplash.com/photo-1618219908412-a29a1bb7b86e?w=1400&q=90&auto=format&fit=crop'
 }
-
-// ─── MAIN HANDLER ─────────────────────────────────────────────────────────────
 
 export async function POST(req: Request) {
   try {
@@ -620,27 +697,55 @@ export async function POST(req: Request) {
     try { if (answersRaw) answers = JSON.parse(answersRaw) } catch { /**/ }
 
     const dims = parseDims(formData)
-    const hasDims = dims.widthFt !== 14 || dims.lengthFt !== 16 // not just defaults
+    console.log(`[Pipeline] ${style} ${roomType} | ${dims.widthFt}×${dims.lengthFt}ft`)
 
-    console.log(`[Pipeline] ${style} ${roomType} | ${dims.widthFt}×${dims.lengthFt}ft | ${dims.sqft}sqft`)
-
-    // ── STAGE 1: Vision Analysis (parallel) ──────────────────────────────────
+    // ── STAGE 1: Vision analysis ──────────────────────────────────────────────
     const { roomContext, furnitureContext } = await analyzeImages(anthropic, roomFile, furnFile)
-    if (roomContext)     console.log('[Vision] Room:', roomContext.slice(0, 80))
-    if (furnitureContext) console.log('[Vision] Furniture:', furnitureContext.slice(0, 80))
 
-    // ── STAGE 2: Layout Planning ──────────────────────────────────────────────
+    // ── STAGE 2: Layout planning ──────────────────────────────────────────────
     const layout = await planLayout(anthropic, style, roomType, dims, answers, custom, roomContext, furnitureContext)
-    console.log(`[Layout] Generated ${layout.furniture.length} furniture pieces`)
+    console.log(`[Layout] ${layout.furniture?.length || 0} pieces`)
 
-    // ── STAGE 3: SVG Floor Plan (deterministic from JSON) ────────────────────
+    // ── STAGE 3: SVG floor plan ───────────────────────────────────────────────
     const svgString       = generateFloorPlanSVG(layout)
     const floorPlanDataUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgString)}`
 
-    // ── STAGE 4: Return layout + floor plan (no image generation) ────────────
+    // ── STAGE 4: Build spatially-exact render prompt ──────────────────────────
+    const { prompt } = buildRenderPrompt(layout)
+
+    // ── STAGE 5: Nano Banana image generation ────────────────────────────────
+    // Primary: gemini-2.5-flash-image (Nano Banana) — fast, great for interiors
+    // Fallback: gemini-3-pro-image (Nano Banana Pro) — higher quality with reasoning
+    // Final fallback: curated Unsplash photo for the style+room combo
+    let photoUrl: string = ''
+
+    const nanoBananaPrompt = [
+      prompt,
+      // Nano Banana understands spatial descriptions well — emphasise layout
+      `Photorealistic interior design photograph. Wide angle corner shot. Professional lighting. No people. No text.`,
+    ].join(' ')
+
+    // Try Nano Banana (fast)
+    photoUrl = await generateWithNanoBanana(nanoBananaPrompt, 'gemini-2.5-flash-image') || ''
+
+    // Retry with Nano Banana Pro (better spatial reasoning) if flash fails
+    if (!photoUrl) {
+      console.log('[NanoBanana] Flash failed, trying Nano Banana Pro...')
+      photoUrl = await generateWithNanoBanana(nanoBananaPrompt, 'gemini-3-pro-image') || ''
+    }
+
+    // Last resort — curated Unsplash for style+room
+    if (!photoUrl) {
+      console.log('[NanoBanana] Both models failed, using curated fallback')
+      photoUrl = getFallbackImage(style, roomType)
+    }
+
+    console.log('[Stage 5] Image source:', photoUrl.startsWith('data:') ? 'Nano Banana ✓' : photoUrl.startsWith('https://images.unsplash') ? 'Unsplash fallback' : 'unknown')
+
+    // ── STAGE 6: Return all outputs ───────────────────────────────────────────
     return NextResponse.json({
-      image:     '',   // no photo render — OpenAI disabled
-      floorPlan: floorPlanDataUrl,
+      image:         photoUrl,
+      floorPlan:     floorPlanDataUrl,
       hasDimensions: true,
       dimensions: {
         w:    String(dims.widthFt),
@@ -654,7 +759,7 @@ export async function POST(req: Request) {
         description: layout.description || `A stunning ${style} ${roomType}.`,
         spatialNote: layout.spatialNotes || '',
         colors:      layout.colors      || [],
-        furniture:   layout.furniture.filter((f: { type: string }) => f.type !== 'rug').map((f: { label: string }) => f.label).slice(0, 6),
+        furniture:   (layout.furniture || []).filter((f: { type: string }) => f.type !== 'rug').map((f: { label: string }) => f.label).slice(0,6),
         tips:        layout.tips        || [],
         materials:   layout.materials   || [],
       },
