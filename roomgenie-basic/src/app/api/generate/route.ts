@@ -506,41 +506,39 @@ function buildRenderPrompt(layout: RoomLayoutJSON): { prompt: string; negative: 
 }
 
 
-// ─── STAGE 5: NANO BANANA PRO (Google Gemini Image Generation) ───────────────
+// ─── STAGE 5: NANO BANANA (Google Gemini Image Generation) ───────────────────
 //
 // Nano Banana = Google's codename for Gemini native image generation
-// Models available via Google AI Studio / Gemini API:
-//   gemini-2.5-flash-image   = Nano Banana       (fast, cheap)
-//   gemini-3-pro-image       = Nano Banana Pro    (best quality, spatial reasoning)
-//   gemini-3.1-flash-image   = Nano Banana 2      (high-volume)
+// Correct model strings for the Gemini API:
+//   gemini-2.0-flash-preview-image-generation  = Nano Banana (fast)
+//   imagen-3.0-generate-002                    = Imagen 3 (best quality, $0.03/image)
 //
-// We use gemini-2.5-flash-image (Nano Banana) as primary — fastest and most cost-effective
-// Falls back to Nano Banana Pro for a retry if needed
-// Set GEMINI_API_KEY in Vercel environment variables (from Google AI Studio)
+// API key from: aistudio.google.com → Get API Key → set as GEMINI_API_KEY in Vercel
 
-async function generateWithNanoBanana(
-  prompt: string,
-  model: 'gemini-2.5-flash-image' | 'gemini-3-pro-image' | 'gemini-3.1-flash-image' = 'gemini-2.5-flash-image'
-): Promise<string | null> {
+async function generateWithNanoBanana(prompt: string): Promise<string | null> {
   const apiKey = process.env.GEMINI_API_KEY
-  if (!apiKey) { console.log('[NanoBanana] No GEMINI_API_KEY set'); return null }
+  if (!apiKey) { console.log('[NanoBanana] No GEMINI_API_KEY'); return null }
 
+  // Try Imagen 3 first (best quality for interiors, $0.03/image)
+  const imagen3Result = await tryImagen3(apiKey, prompt)
+  if (imagen3Result) return imagen3Result
+
+  // Fallback: Gemini 2.0 Flash image generation (free tier)
+  return await tryGeminiFlashImage(apiKey, prompt)
+}
+
+async function tryImagen3(apiKey: string, prompt: string): Promise<string | null> {
   try {
-    console.log(`[NanoBanana] Generating with ${model}...`)
-
-    // Gemini API image generation endpoint
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`
+    console.log('[Imagen3] Generating interior render...')
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-generate-002:predict?key=${apiKey}`
 
     const body = {
-      contents: [{
-        parts: [{
-          text: prompt
-        }]
-      }],
-      generationConfig: {
-        responseModalities: ['IMAGE', 'TEXT'],
-        // Nano Banana Pro supports higher resolution
-        ...(model === 'gemini-3-pro-image' ? {} : {}),
+      instances: [{ prompt: prompt.slice(0, 2000) }],
+      parameters: {
+        sampleCount:     1,
+        aspectRatio:     '16:9',
+        safetyFilterLevel: 'block_few',
+        personGeneration: 'dont_allow',
       }
     }
 
@@ -552,72 +550,32 @@ async function generateWithNanoBanana(
 
     if (!resp.ok) {
       const err = await resp.text()
-      console.error(`[NanoBanana] ${model} error ${resp.status}:`, err.slice(0, 200))
+      console.error('[Imagen3] Error:', resp.status, err.slice(0, 200))
       return null
     }
 
     const data = await resp.json()
-
-    // Extract image from response parts
-    const candidates = data.candidates || []
-    for (const candidate of candidates) {
-      const parts = candidate.content?.parts || []
-      for (const part of parts) {
-        if (part.inlineData?.mimeType?.startsWith('image/')) {
-          const b64 = part.inlineData.data
-          const mime = part.inlineData.mimeType
-          console.log(`[NanoBanana] ${model} success ✓`)
-          return `data:${mime};base64,${b64}`
-        }
-        // Some models return a URL
-        if (part.fileData?.fileUri) {
-          console.log(`[NanoBanana] ${model} fileUri success ✓`)
-          return part.fileData.fileUri
-        }
-      }
+    const pred  = data.predictions?.[0]
+    if (pred?.bytesBase64Encoded) {
+      console.log('[Imagen3] Success ✓')
+      return `data:image/png;base64,${pred.bytesBase64Encoded}`
     }
-
-    console.error('[NanoBanana] No image in response:', JSON.stringify(data).slice(0, 300))
+    console.error('[Imagen3] No image in response:', JSON.stringify(data).slice(0, 200))
     return null
-
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err)
-    console.error('[NanoBanana] Exception:', msg)
+  } catch (e) {
+    console.error('[Imagen3] Exception:', e)
     return null
   }
 }
 
-// Edit an existing image using Nano Banana Pro's image editing capability
-// Used by render-from-3d to make the 3D SVG photorealistic
-async function editWithNanaBanana(
-  imageBase64: string,
-  imageMime: string,
-  prompt: string
-): Promise<string | null> {
-  const apiKey = process.env.GEMINI_API_KEY
-  if (!apiKey) { console.log('[NanaBanana Edit] No GEMINI_API_KEY'); return null }
-
+async function tryGeminiFlashImage(apiKey: string, prompt: string): Promise<string | null> {
   try {
-    console.log('[NanaBanana Edit] Editing image with gemini-2.5-flash-image...')
-
-    // Use the conversational image edit endpoint (multimodal input)
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${apiKey}`
+    console.log('[GeminiFlash] Falling back to gemini-2.0-flash image generation...')
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-preview-image-generation:generateContent?key=${apiKey}`
 
     const body = {
-      contents: [{
-        parts: [
-          {
-            inlineData: {
-              mimeType: imageMime,
-              data:     imageBase64,
-            }
-          },
-          { text: prompt }
-        ]
-      }],
-      generationConfig: {
-        responseModalities: ['IMAGE', 'TEXT'],
-      }
+      contents: [{ parts: [{ text: prompt.slice(0, 2000) }] }],
+      generationConfig: { responseModalities: ['TEXT', 'IMAGE'] }
     }
 
     const resp = await fetch(url, {
@@ -627,24 +585,21 @@ async function editWithNanaBanana(
     })
 
     if (!resp.ok) {
-      console.error('[NanaBanana Edit] Error:', resp.status, await resp.text().then(t=>t.slice(0,200)))
+      console.error('[GeminiFlash] Error:', resp.status, await resp.text().then(t => t.slice(0, 200)))
       return null
     }
 
     const data = await resp.json()
-    const candidates = data.candidates || []
-    for (const candidate of candidates) {
-      for (const part of (candidate.content?.parts || [])) {
-        if (part.inlineData?.mimeType?.startsWith('image/')) {
-          console.log('[NanaBanana Edit] Success ✓')
-          return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`
-        }
+    for (const part of (data.candidates?.[0]?.content?.parts || [])) {
+      if (part.inlineData?.mimeType?.startsWith('image/')) {
+        console.log('[GeminiFlash] Success ✓')
+        return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`
       }
     }
+    console.error('[GeminiFlash] No image in response')
     return null
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err)
-    console.error('[NanaBanana Edit] Exception:', msg)
+  } catch (e) {
+    console.error('[GeminiFlash] Exception:', e)
     return null
   }
 }
@@ -713,34 +668,47 @@ export async function POST(req: Request) {
     // ── STAGE 4: Build spatially-exact render prompt ──────────────────────────
     const { prompt } = buildRenderPrompt(layout)
 
-    // ── STAGE 5: Nano Banana image generation ────────────────────────────────
-    // Primary: gemini-2.5-flash-image (Nano Banana) — fast, great for interiors
-    // Fallback: gemini-3-pro-image (Nano Banana Pro) — higher quality with reasoning
-    // Final fallback: curated Unsplash photo for the style+room combo
-    let photoUrl: string = ''
+    // ── STAGE 5: Nano Banana / Imagen 3 image generation ─────────────────────
+    // Build a crisp, interior-specific prompt from layoutJSON
+    // Imagen 3 and Gemini follow clear structured prompts best
 
-    const nanoBananaPrompt = [
-      prompt,
-      // Nano Banana understands spatial descriptions well — emphasise layout
-      `Photorealistic interior design photograph. Wide angle corner shot. Professional lighting. No people. No text.`,
-    ].join(' ')
+    const mainFurniture = (layout.furniture || [])
+      .filter((f: { type: string; heightFt: number }) => f.type !== 'rug' && f.heightFt > 1.0)
+      .slice(0, 7)
+      .map((f: { label: string; color: string; material: string }) => `${f.label} in ${f.color} ${f.material}`)
+      .join(', ')
 
-    // Try Nano Banana (fast)
-    photoUrl = await generateWithNanoBanana(nanoBananaPrompt, 'gemini-2.5-flash-image') || ''
+    const wallColor  = layout.walls?.color    || '#F5F2ED'
+    const floorMat   = layout.floor?.material || 'hardwood'
+    const floorColor = layout.floor?.color    || '#C4A882'
+    const ceilH      = dims.heightFt
+    const ceilDesc   = ceilH >= 12 ? `soaring ${ceilH}ft ceiling` : ceilH >= 10 ? `${ceilH}ft high ceiling` : `${ceilH}ft ceiling`
 
-    // Retry with Nano Banana Pro (better spatial reasoning) if flash fails
+    // Structured prompt — Imagen 3 responds best to clear, sentence-based descriptions
+    const imagePrompt = [
+      `Professional architectural interior design photograph of a ${style} ${roomType}.`,
+      `The room is ${dims.widthFt} feet wide by ${dims.lengthFt} feet long with a ${ceilDesc}.`,
+      `Walls are painted ${wallColor}, floor is ${floorMat} in ${floorColor}.`,
+      mainFurniture ? `Furniture includes: ${mainFurniture}.` : '',
+      layout.styleDetails ? `Style: ${layout.styleDetails}.` : '',
+      layout.mood         ? `Mood: ${layout.mood}.`           : '',
+      answers.mood        ? `Atmosphere: ${answers.mood}.`    : '',
+      custom              ? `${custom}.`                      : '',
+      `Wide angle corner shot showing the entire room and all furniture.`,
+      `Magazine-quality photorealistic render, perfect natural and artificial lighting, sharp focus, ultra detailed.`,
+      `No people, no text overlays, no watermarks.`,
+    ].filter(Boolean).join(' ')
+
+    console.log('[Prompt] Interior prompt:', imagePrompt.slice(0, 150))
+
+    let photoUrl: string = await generateWithNanoBanana(imagePrompt) || ''
+
     if (!photoUrl) {
-      console.log('[NanoBanana] Flash failed, trying Nano Banana Pro...')
-      photoUrl = await generateWithNanoBanana(nanoBananaPrompt, 'gemini-3-pro-image') || ''
-    }
-
-    // Last resort — curated Unsplash for style+room
-    if (!photoUrl) {
-      console.log('[NanoBanana] Both models failed, using curated fallback')
+      console.log('[Stage 5] All AI failed, using curated fallback')
       photoUrl = getFallbackImage(style, roomType)
     }
 
-    console.log('[Stage 5] Image source:', photoUrl.startsWith('data:') ? 'Nano Banana ✓' : photoUrl.startsWith('https://images.unsplash') ? 'Unsplash fallback' : 'unknown')
+    console.log('[Stage 5]', photoUrl.startsWith('data:') ? 'AI image ✓' : 'Curated fallback')
 
     // ── STAGE 6: Return all outputs ───────────────────────────────────────────
     return NextResponse.json({
